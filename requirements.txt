@@ -1,0 +1,8 @@
+# Core dependencies
+Scrapy>=2.11.0
+psycopg2-binary>=2.9.9
+Pillow>=10.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+alembic>=1.13.0
+redis>=5.0.0

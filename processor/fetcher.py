@@ -1,0 +1,264 @@
+"""Image fetching module for InvisibleCrawler.
+
+Handles downloading images from URLs with validation and error handling.
+"""
+
+import hashlib
+import logging
+from dataclasses import dataclass
+from io import BytesIO
+
+import requests
+from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ImageFetchResult:
+    """Result of fetching an image.
+
+    Attributes:
+        success: Whether the fetch was successful.
+        url: The URL that was fetched.
+        content: Raw binary content (if successful).
+        content_type: MIME type from HTTP headers.
+        file_size: Size in bytes.
+        width: Image width in pixels (if parseable).
+        height: Image height in pixels (if parseable).
+        format: Image format (e.g., 'JPEG', 'PNG').
+        sha256_hash: SHA-256 hash of the content.
+        error_message: Description of failure (if unsuccessful).
+    """
+
+    success: bool
+    url: str
+    content: bytes | None = None
+    content_type: str | None = None
+    file_size: int = 0
+    width: int | None = None
+    height: int | None = None
+    format: str | None = None
+    sha256_hash: str | None = None
+    error_message: str | None = None
+
+
+class ImageFetcher:
+    """Fetches and validates images from URLs.
+
+    Implements conservative fetching with validation:
+    - Content-type whitelisting
+    - Size thresholds (min/max)
+    - Dimension validation
+    - Timeout and retry logic
+
+    Attributes:
+        min_file_size: Minimum file size in bytes (default: 1024 = 1KB).
+        max_file_size: Maximum file size in bytes (default: 50MB).
+        min_dimensions: Minimum width/height in pixels (default: 100x100).
+        timeout: Request timeout in seconds (default: 30).
+        session: Reusable requests Session for connection pooling.
+    """
+
+    # Allowed content types
+    ALLOWED_CONTENT_TYPES = {
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/svg+xml",
+        "image/bmp",
+        "image/tiff",
+    }
+
+    def __init__(
+        self,
+        min_file_size: int = 1024,  # 1KB minimum
+        max_file_size: int = 50 * 1024 * 1024,  # 50MB maximum
+        min_width: int = 256,
+        min_height: int = 256,
+        timeout: int = 30,
+    ) -> None:
+        """Initialize the fetcher with validation thresholds.
+
+        Args:
+            min_file_size: Minimum file size in bytes.
+            max_file_size: Maximum file size in bytes.
+            min_width: Minimum image width in pixels.
+            min_height: Minimum image height in pixels.
+            timeout: HTTP request timeout in seconds.
+        """
+        self.min_file_size = min_file_size
+        self.max_file_size = max_file_size
+        self.min_dimensions = (min_width, min_height)
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": "InvisibleCrawler/0.1 (Image fetcher for research)",
+            }
+        )
+
+    def fetch(self, url: str) -> ImageFetchResult:
+        """Fetch and validate an image from a URL.
+
+        Args:
+            url: The image URL to fetch.
+
+        Returns:
+            ImageFetchResult with success status and metadata.
+        """
+        logger.debug(f"Fetching image: {url}")
+
+        try:
+            # Make HTTP request with streaming for large files
+            response = self.session.get(
+                url,
+                timeout=self.timeout,
+                stream=True,
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+
+        except requests.exceptions.Timeout:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message="Request timeout",
+            )
+        except requests.exceptions.ConnectionError as e:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=f"Connection error: {e}",
+            )
+        except requests.exceptions.HTTPError as e:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=f"HTTP error: {e}",
+            )
+        except requests.exceptions.RequestException as e:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=f"Request failed: {e}",
+            )
+
+        # Validate content type
+        content_type = response.headers.get("Content-Type", "").lower().split(";")[0]
+        if content_type and content_type not in self.ALLOWED_CONTENT_TYPES:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=f"Invalid content type: {content_type}",
+            )
+
+        # Check file size from headers (if available)
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            file_size = int(content_length)
+            if file_size < self.min_file_size:
+                return ImageFetchResult(
+                    success=False,
+                    url=url,
+                    error_message=f"File too small: {file_size} bytes",
+                )
+            if file_size > self.max_file_size:
+                return ImageFetchResult(
+                    success=False,
+                    url=url,
+                    error_message=f"File too large: {file_size} bytes",
+                )
+
+        # Read content with size validation
+        try:
+            content = self._read_content_with_limit(response)
+        except ValueError as e:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=str(e),
+            )
+
+        # Validate minimum file size
+        if len(content) < self.min_file_size:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=f"File too small: {len(content)} bytes",
+            )
+
+        # Generate SHA-256 hash
+        sha256_hash = hashlib.sha256(content).hexdigest()
+
+        # Parse image dimensions
+        width, height, img_format = self._parse_image_dimensions(content)
+
+        # Validate dimensions if parseable
+        if width and height:
+            if width < self.min_dimensions[0] or height < self.min_dimensions[1]:
+                return ImageFetchResult(
+                    success=False,
+                    url=url,
+                    error_message=f"Image too small: {width}x{height}",
+                )
+
+        logger.debug(f"Successfully fetched image: {url} ({len(content)} bytes)")
+
+        return ImageFetchResult(
+            success=True,
+            url=url,
+            content=content,
+            content_type=content_type,
+            file_size=len(content),
+            width=width,
+            height=height,
+            format=img_format,
+            sha256_hash=sha256_hash,
+        )
+
+    def _read_content_with_limit(self, response: requests.Response) -> bytes:
+        """Read response content with size limit.
+
+        Args:
+            response: Requests Response object.
+
+        Returns:
+            Content as bytes.
+
+        Raises:
+            ValueError: If content exceeds max_file_size.
+        """
+        chunks = []
+        total_size = 0
+
+        for chunk in response.iter_content(chunk_size=8192):
+            chunks.append(chunk)
+            total_size += len(chunk)
+
+            if total_size > self.max_file_size:
+                raise ValueError(f"File exceeds maximum size: {self.max_file_size} bytes")
+
+        return b"".join(chunks)
+
+    def _parse_image_dimensions(self, content: bytes) -> tuple[int | None, int | None, str | None]:
+        """Parse image dimensions from binary content.
+
+        Args:
+            content: Raw image bytes.
+
+        Returns:
+            Tuple of (width, height, format) or (None, None, None) on failure.
+        """
+        try:
+            img = Image.open(BytesIO(content))
+            return img.width, img.height, img.format
+        except Exception as e:
+            logger.debug(f"Could not parse image dimensions: {e}")
+            return None, None, None
+
+    def close(self) -> None:
+        """Close the HTTP session."""
+        self.session.close()

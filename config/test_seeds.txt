@@ -1,0 +1,8 @@
+# Test seed domains for crawler development
+# Add one domain per line
+# Crawler will start from these domains during testing
+
+https://dfactory.co/
+https://postviewscounter.com/
+https://www.pap.pl/
+https://wordpress.org/
