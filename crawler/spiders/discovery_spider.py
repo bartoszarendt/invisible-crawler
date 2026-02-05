@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from scrapy import Spider
+from scrapy import Spider, signals
 from scrapy.http import Request, Response, TextResponse
 
 from storage.db import get_cursor
@@ -35,6 +35,46 @@ class DiscoverySpider(Spider):
         "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
     }
 
+    @classmethod
+    def from_crawler(cls, crawler: Any, *args: Any, **kwargs: Any) -> "DiscoverySpider":
+        """Create spider instance from crawler.
+
+        Args:
+            crawler: Scrapy Crawler instance.
+            *args: Positional arguments for spider.
+            **kwargs: Keyword arguments for spider.
+
+        Returns:
+            New spider instance.
+        """
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        crawler.signals.connect(spider.spider_opened, signal=signals.spider_opened)
+        return spider
+
+    def spider_opened(self, spider: Spider) -> None:
+        """Signal handler called when spider is opened.
+
+        Creates a crawl run record in the database.
+
+        Args:
+            spider: The spider instance.
+        """
+        try:
+            with get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO crawl_runs (mode, status, seed_source)
+                    VALUES (%s, %s, %s)
+                    RETURNING id
+                    """,
+                    ("discovery", "running", self.seeds_file or "redis"),
+                )
+                self.crawl_run_id = cursor.fetchone()[0]
+                self.logger.info(f"Created crawl run: {self.crawl_run_id}")
+        except Exception as e:
+            self.logger.warning(f"Failed to create crawl run: {e}")
+            self.crawl_run_id = None
+
     def __init__(self, seeds: str | None = None, **kwargs: Any) -> None:
         """Initialize the spider with seed domains.
 
@@ -51,6 +91,7 @@ class DiscoverySpider(Spider):
         self.block_on_login = _get_bool(kwargs.get("block_on_login"), True)
         self.images_found: int = 0
         self.pages_crawled: int = 0
+        self.crawl_run_id: Any = None  # Track current crawl run
         self._domains: list[str] = []
         self._allowlist = self._load_domain_list(self.allowlist_file)
         self._blocklist = self._load_domain_list(self.blocklist_file)
@@ -60,17 +101,48 @@ class DiscoverySpider(Spider):
     def start_requests(self) -> Any:
         """Generate initial requests from seed domains.
 
+        Supports two modes:
+        - Phase 2 (Redis): Consume seeds from Redis start_urls sorted set
+        - Phase 1 (File): Read seeds from local seed file
+
         Yields:
             Request objects for each seed domain.
         """
+        # Try Redis start_urls first (Phase 2 mode)
+        redis_seeds = list(self._get_redis_start_urls())
+        if redis_seeds:
+            self.logger.info(f"Using Redis start_urls: {len(redis_seeds)} seeds")
+            for url in redis_seeds:
+                domain_netloc = urlparse(url).netloc
+                if self._allowlist and domain_netloc not in self._allowlist:
+                    self.logger.info(f"Skipping seed (not in allowlist): {url}")
+                    continue
+                if domain_netloc in self._blocklist:
+                    self.logger.info(f"Skipping seed (blocked): {url}")
+                    continue
+
+                self._domains.append(url)
+                self.logger.info(f"Adding seed domain: {url}")
+
+                yield Request(
+                    url=url,
+                    callback=self.parse,
+                    errback=self.handle_error,
+                    meta={"depth": 0, "domain": domain_netloc},
+                )
+            return
+
+        # Fall back to file-based seeds (Phase 1 mode)
         if not self.seeds_file:
-            self.logger.error("No seeds file provided. Use -a seeds=config/seeds.txt")
+            self.logger.error("No seeds file provided and Redis start_urls empty. Use -a seeds=config/seeds.txt")
             return
 
         seeds_path = Path(self.seeds_file)
         if not seeds_path.exists():
             self.logger.error(f"Seeds file not found: {seeds_path}")
             return
+
+        self.logger.info(f"Using file-based seeds: {seeds_path}")
 
         # Read and parse seed domains
         with open(seeds_path, encoding="utf-8") as f:
@@ -103,6 +175,30 @@ class DiscoverySpider(Spider):
                     errback=self.handle_error,
                     meta={"depth": 0, "domain": urlparse(domain).netloc},
                 )
+
+    def _get_redis_start_urls(self) -> list[str]:
+        """Fetch start URLs from Redis sorted set.
+
+        Returns:
+            List of URLs from Redis, or empty list if Redis unavailable.
+        """
+        import os
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+        try:
+            import redis
+            client = redis.from_url(redis_url, socket_connect_timeout=2)
+
+            # Get URLs from sorted set (ordered by priority)
+            queue_key = f"{self.name}:start_urls"
+            # zrange returns members in order of score (priority)
+            urls = client.zrange(queue_key, 0, -1)
+
+            # Decode bytes to strings
+            return [url.decode("utf-8") if isinstance(url, bytes) else url for url in urls]
+        except Exception as e:
+            self.logger.debug(f"Could not fetch Redis start_urls: {e}")
+            return []
 
     def parse(self, response: Response) -> Any:
         """Parse HTML page and extract images and links.
@@ -163,15 +259,20 @@ class DiscoverySpider(Spider):
             images_found=len(image_urls),
         )
 
-        # Yield image data for processing
+        # Yield image download requests with callback
         for img_url in image_urls:
-            yield {
-                "type": "image",
-                "url": img_url,
-                "source_page": response.url,
-                "source_domain": current_domain,
-                "crawl_type": "discovery",
-            }
+            yield Request(
+                url=img_url,
+                callback=self.parse_image,
+                errback=self.handle_image_error,
+                meta={
+                    "source_page": response.url,
+                    "source_domain": current_domain,
+                    "crawl_type": "discovery",
+                },
+                priority=response.meta.get("depth", 0) + 1,  # Lower priority than page crawling
+                dont_filter=False,
+            )
 
         # Follow same-domain links if we haven't reached max pages
         if self.pages_crawled < self.max_pages:
@@ -366,6 +467,41 @@ class DiscoverySpider(Spider):
         except Exception:
             return False
 
+    def parse_image(self, response: Response) -> Any:
+        """Parse downloaded image response.
+
+        Args:
+            response: Scrapy Response with image data.
+
+        Yields:
+            Item dict with image metadata for pipeline processing.
+        """
+        # Extract metadata from response
+        meta = response.meta
+        source_page = meta.get("source_page", "")
+        source_domain = meta.get("source_domain", "")
+        crawl_type = meta.get("crawl_type", "discovery")
+
+        # Yield item with response for pipeline to process
+        yield {
+            "type": "image",
+            "url": response.url,
+            "source_page": source_page,
+            "source_domain": source_domain,
+            "crawl_type": crawl_type,
+            "response": response,  # Attach response for pipeline processing
+        }
+
+    def handle_image_error(self, failure: Any) -> None:
+        """Handle image download failures.
+
+        Args:
+            failure: Twisted Failure object.
+        """
+        url = failure.request.url if hasattr(failure, "request") else "unknown"
+        self.logger.debug(f"Failed to download image {url}: {failure.getErrorMessage()}")
+        # Don't re-raise to avoid killing the spider
+
     def handle_error(self, failure: Any) -> None:
         """Handle request errors.
 
@@ -409,6 +545,25 @@ class DiscoverySpider(Spider):
         Args:
             reason: Why the spider closed.
         """
+        # Update crawl run if one was created
+        if self.crawl_run_id:
+            try:
+                with get_cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE crawl_runs
+                        SET completed_at = CURRENT_TIMESTAMP,
+                            status = %s,
+                            pages_crawled = %s,
+                            images_found = %s
+                        WHERE id = %s
+                        """,
+                        ("completed" if reason == "finished" else "failed", self.pages_crawled, self.images_found, self.crawl_run_id),
+                    )
+                    self.logger.info(f"Updated crawl run: {self.crawl_run_id}")
+            except Exception as e:
+                self.logger.warning(f"Failed to update crawl run: {e}")
+
         self.logger.info("=" * 50)
         self.logger.info(f"Spider closed: {reason}")
         self.logger.info(f"Pages crawled: {self.pages_crawled}")
@@ -434,8 +589,8 @@ class DiscoverySpider(Spider):
             with get_cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO crawl_log (page_url, domain, status, images_found, error_message, crawl_type)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO crawl_log (page_url, domain, status, images_found, error_message, crawl_type, crawl_run_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         page_url,
@@ -444,6 +599,7 @@ class DiscoverySpider(Spider):
                         images_found,
                         error_message,
                         "discovery",
+                        self.crawl_run_id,
                     ),
                 )
         except Exception as exc:

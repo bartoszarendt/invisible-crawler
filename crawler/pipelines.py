@@ -11,7 +11,8 @@ from typing import Any
 from scrapy.exceptions import DropItem
 from scrapy.spiders import Spider
 
-from processor.fetcher import ImageFetcher
+from processor.async_fetcher import ScrapyImageDownloader
+from processor.fetcher import ImageFetcher, ImageFetchResult
 from storage.db import get_cursor
 
 logger = logging.getLogger(__name__)
@@ -21,12 +22,14 @@ class ImageProcessingPipeline:
     """Pipeline for processing discovered images.
 
     This pipeline receives image metadata from the spider,
-    downloads the image, generates fingerprints, and stores
-    metadata in the database.
+    downloads the image (using async fetching via Scrapy's downloader),
+    generates fingerprints, and stores metadata in the database.
 
     Attributes:
         stats: Dictionary tracking pipeline statistics.
-        fetcher: ImageFetcher instance for downloading images.
+        downloader: ScrapyImageDownloader for processing responses.
+        sync_fetcher: ImageFetcher for synchronous fallback.
+        discovery_refresh_after_days: Days before refreshing existing images.
     """
 
     def __init__(self) -> None:
@@ -39,7 +42,8 @@ class ImageProcessingPipeline:
             "images_deduplicated": 0,
             "total_bytes_downloaded": 0,
         }
-        self.fetcher: ImageFetcher | None = None
+        self.downloader: ScrapyImageDownloader | None = None
+        self.sync_fetcher: ImageFetcher | None = None
         self.discovery_refresh_after_days = _get_int_env("DISCOVERY_REFRESH_AFTER_DAYS", 0)
 
     @classmethod
@@ -69,7 +73,10 @@ class ImageProcessingPipeline:
             "images_deduplicated": 0,
             "total_bytes_downloaded": 0,
         }
-        self.fetcher = ImageFetcher()
+        # Use async downloader that integrates with Scrapy
+        self.downloader = ScrapyImageDownloader()
+        # Keep sync fetcher for testing/standalone use
+        self.sync_fetcher = ImageFetcher()
 
     def close_spider(self, spider: Spider) -> None:
         """Called when spider closes.
@@ -77,8 +84,8 @@ class ImageProcessingPipeline:
         Args:
             spider: The spider instance.
         """
-        if self.fetcher:
-            self.fetcher.close()
+        if self.sync_fetcher:
+            self.sync_fetcher.close()
 
         # Close database connection pool to release resources
         from storage.db import close_all_connections
@@ -91,14 +98,14 @@ class ImageProcessingPipeline:
             logger.info(f"  {key}: {value}")
         logger.info("=" * 50)
 
-    def process_item(self, item: dict[str, Any], spider: Spider) -> dict[str, Any]:
+    def process_item(self, item: dict[str, Any], spider: Spider) -> Any:
         """Process a scraped image item.
 
-        Downloads the image, generates SHA-256 fingerprint,
-        and stores metadata in database.
+        Receives items with already-downloaded image responses from spider.
+        Validates, fingerprints, and stores metadata.
 
         Args:
-            item: Dictionary containing image metadata.
+            item: Dictionary containing image metadata and response.
             spider: The spider that yielded the item.
 
         Returns:
@@ -112,83 +119,67 @@ class ImageProcessingPipeline:
 
         self.stats["images_received"] += 1
 
-        try:
-            # Download and process the image
-            result = self._process_image(item)
-
-            if result["status"] == "downloaded":
-                self.stats["images_downloaded"] += 1
-                self.stats["total_bytes_downloaded"] += result.get("file_size", 0)
-            elif result["status"] == "skipped":
-                self.stats["images_skipped"] += 1
-            elif result["status"] == "deduplicated":
-                self.stats["images_deduplicated"] += 1
-            elif result["status"] == "failed":
-                self.stats["images_failed"] += 1
-
-            logger.debug(f"Processed image: {item.get('url')} ({result['status']})")
-
-        except Exception as e:
-            self.stats["images_failed"] += 1
-            logger.error(f"Failed to process image {item.get('url')}: {e}")
-            # Don't raise DropItem on interruption-related errors
-            if "shutdown" in str(e).lower() or "interrupt" in str(e).lower():
-                logger.info(f"Gracefully handling interruption for {item.get('url')}")
-                return item
-            raise DropItem(f"Failed to process image: {e}")
-
-        return item
-
-    def _process_image(self, item: dict[str, Any]) -> dict[str, Any]:
-        """Download and process a single image.
-
-        Args:
-            item: Dictionary containing image metadata.
-
-        Returns:
-            Dictionary with processing result.
-        """
         url = item.get("url", "")
         source_page = item.get("source_page", "")
         source_domain = item.get("source_domain", "")
         crawl_type = item.get("crawl_type", "discovery")
+        response = item.get("response")  # Spider attaches Scrapy Response
 
-        if not self.fetcher:
-            raise RuntimeError("ImageFetcher not initialized")
+        if not response:
+            self.stats["images_failed"] += 1
+            logger.error(f"Image item missing response: {url}")
+            raise DropItem("Missing response object")
 
+        # Check if we should skip this image (discovery mode only)
         if crawl_type == "discovery":
             existing = self._get_existing_image_by_url(url)
             if existing:
                 image_id, last_seen_at = existing
                 if not self._should_refresh(last_seen_at):
                     self._ensure_provenance(image_id, source_page, source_domain)
-                    return {
-                        "status": "skipped",
-                        "image_id": str(image_id),
-                        "reason": "already_seen",
-                    }
+                    self.stats["images_skipped"] += 1
+                    logger.debug(f"Skipped image (already seen): {url}")
+                    return item
 
-        # Fetch the image
-        fetch_result = self.fetcher.fetch(url)
+        # Process the response into ImageFetchResult
+        if self.downloader is None:
+            raise RuntimeError("Downloader not initialized")
+
+        fetch_result = self.downloader.process_response(url, response)
 
         if not fetch_result.success:
-            logger.warning(f"Failed to fetch image {url}: {fetch_result.error_message}")
-            return {"status": "failed", "error": fetch_result.error_message}
+            self.stats["images_failed"] += 1
+            logger.warning(f"Failed to validate image {url}: {fetch_result.error_message}")
+            raise DropItem(f"Image validation failed: {fetch_result.error_message}")
 
         # Store image metadata in database
-        return self._store_image_metadata(
-            url=url,
-            source_page=source_page,
-            source_domain=source_domain,
-            fetch_result=fetch_result,
-        )
+        try:
+            result = self._store_image_metadata(
+                url=url,
+                source_page=source_page,
+                source_domain=source_domain,
+                fetch_result=fetch_result,
+            )
+
+            if result["status"] == "downloaded":
+                self.stats["images_downloaded"] += 1
+                self.stats["total_bytes_downloaded"] += fetch_result.file_size
+            elif result["status"] == "deduplicated":
+                self.stats["images_deduplicated"] += 1
+
+        except Exception as e:
+            self.stats["images_failed"] += 1
+            logger.error(f"Failed to store image {url}: {e}")
+            raise DropItem(f"Failed to store image: {e}")
+
+        return item
 
     def _store_image_metadata(
         self,
         url: str,
         source_page: str,
         source_domain: str,
-        fetch_result: Any,
+        fetch_result: ImageFetchResult,
     ) -> dict[str, Any]:
         """Store image metadata in the database.
 
@@ -283,7 +274,9 @@ class ImageProcessingPipeline:
                 cursor.execute("SELECT 1 FROM images WHERE id = %s", (image_id,))
                 exists = cursor.fetchone()
                 if not exists:
-                    logger.warning(f"Image {image_id} not found in database, skipping provenance insertion")
+                    logger.warning(
+                        f"Image {image_id} not found in database, skipping provenance insertion"
+                    )
                     return
 
                 cursor.execute(

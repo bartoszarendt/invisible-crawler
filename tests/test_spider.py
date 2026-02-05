@@ -84,7 +84,7 @@ class TestDiscoverySpider:
         assert not any("other-domain.com" in url for url in links)
 
     def test_parse_yields_image_items(self, spider: DiscoverySpider) -> None:
-        """Test that parse yields image metadata items."""
+        """Test that parse yields image Request objects."""
         request = Request(url="https://example.com/")
         response = HtmlResponse(
             url="https://example.com/",
@@ -95,17 +95,17 @@ class TestDiscoverySpider:
 
         items = list(spider.parse(response))
 
-        # Should yield image items
-        image_items = [
-            item for item in items if isinstance(item, dict) and item.get("type") == "image"
+        # Should yield Request objects for images (not items)
+        image_requests = [
+            item for item in items if isinstance(item, Request) and "/image" in item.url
         ]
-        assert len(image_items) > 0
+        assert len(image_requests) > 0
 
-        # Image items should have required fields
-        for item in image_items:
-            assert "url" in item
-            assert "source_page" in item
-            assert "source_domain" in item
+        # Image requests should have callback and metadata
+        for req in image_requests:
+            assert req.callback is not None
+            assert "source_page" in req.meta
+            assert "source_domain" in req.meta
 
     def test_parse_yields_follow_requests(self, spider: DiscoverySpider) -> None:
         """Test that parse yields follow-up requests."""

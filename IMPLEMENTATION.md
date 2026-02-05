@@ -1,58 +1,83 @@
-# InvisibleCrawler - Phase 1 Implementation (Local, On-Demand)
+# InvisibleCrawler - Phase 2 Implementation (Redis Scheduling)
 
 ## Status
 
 **Date:** 2026-02-05  
-**Phase:** 1 (Local device, manual trigger)  
-**Verification:** ✅ Code reviewed, 32 tests passing, runtime validated against wordpress.org
+**Phase:** 2 (Redis-based scheduling, seed ingestion CLI, crawl run tracking)  
+**Verification:** Code updated, requires testing with Redis instance
 
 ---
 
-## Phase 1 Scope (Current)
+## Phase 2 Scope (Current)
 
-The current implementation is scoped to **local, on-demand crawling** using a seed file you provide. It does **not** include Phase 2 items like Redis scheduling, Tranco-based seeding, or Scrapy broad crawls.
+Phase 2 adds distributed crawling capabilities using Redis-based scheduling and seed ingestion:
 
-### Phase 2 (Explicitly Out of Scope for Now)
-- Redis-based URL frontier and queueing
-- Tranco/Majestic seed ingestion
-- Scrapy broad crawl strategy
-- Distributed crawl orchestration
+- **Redis URL Frontier**: Persistent, priority-based queue with per-domain tracking
+- **Seed Ingestion CLI**: Ingest seeds from Tranco, Majestic, or custom CSV files
+- **Crawl Run Tracking**: Database tracking of crawl runs with status and statistics
+- **Async Image Downloads**: Images downloaded via Scrapy's native request flow
+- **Dual-mode Seeds**: Spider supports both file-based (Phase 1) and Redis-based (Phase 2) seeds
+
+### Phase 1 Features (Retained)
+- Multi-domain spider with same-domain link following
+- Image extraction from `<img>`, `srcset`, `<picture>`, `og:image`
+- SHA-256 fingerprinting for deduplication
+- PostgreSQL metadata storage
+- Politeness: robots.txt, 1 req/sec, per-domain rate limiting
 
 ---
 
-## What Exists (Verified by Code Scan)
+## What Exists (Phase 2)
 
-1. **Multi-Domain Spider** (`crawler/spiders/discovery_spider.py`)
-   - Reads domains/URLs from a seed file
+### Phase 1 Components (Retained)
+
+1. **Multi-Domain Spider** ([crawler/spiders/discovery_spider.py](crawler/spiders/discovery_spider.py))
+   - Reads domains/URLs from seed file OR Redis start_urls
    - Crawls same-domain links only
    - Extracts images from `<img>`, `srcset`, `<picture>`, `og:image`
    - Respects robots.txt and 1 req/sec for HTML pages
+   - Yields image Requests with callback for Scrapy-native downloads
 
-2. **Image Processing Pipeline** (`crawler/pipelines.py`)
-   - Downloads images via `ImageFetcher`
+2. **Image Processing Pipeline** ([crawler/pipelines.py](crawler/pipelines.py))
+   - Receives downloaded image items from spider callbacks
+   - Validates content type, size, and dimensions
    - Computes SHA-256 for deduplication
    - Stores metadata in PostgreSQL (`images`, `provenance`)
    - Updates `last_seen_at` for existing images
 
-3. **Image Fetcher** (`processor/fetcher.py`)
-   - Validates content type
-   - Enforces size limits (min 1KB, max 50MB)
-   - Enforces minimum dimensions (256x256)
-   - Computes SHA-256 on content
-
-4. **Database Layer + Alembic** (`storage/`)
-   - Schema with `images`, `provenance`, `crawl_log`
+3. **Database Layer + Alembic** ([storage/](storage/))
+   - Schema with `images`, `provenance`, `crawl_log`, `crawl_runs`
    - Alembic migrations using `DATABASE_URL`
    - Connection pooling via `ThreadedConnectionPool`
 
-5. **Tests** (`tests/`)
+4. **Tests** ([tests/](tests/))
    - 32 total tests (unit + integration)
    - Mock HTTP server via `pytest-httpserver`
-   - Integration tests require a running PostgreSQL instance
+   - Integration tests require running PostgreSQL
 
-6. **Logging Utilities** (`crawler/logging_config.py`)
-   - Structured JSON formatter and crawl statistics helpers
-   - Not yet wired into spider/pipeline execution
+### Phase 2 Additions
+
+5. **Redis URL Frontier** ([crawler/scheduler.py](crawler/scheduler.py))
+   - `InvisibleRedisScheduler`: Extends scrapy-redis with priority lanes
+   - `DomainPriorityQueue`: Per-domain request tracking
+   - Priority handling: lower priority for refresh crawls
+   - Persistent queues with resume capability
+
+6. **Seed Ingestion CLI** ([crawler/cli.py](crawler/cli.py))
+   - `ingest-seeds`: Ingest domains from Tranco, Majestic, or custom CSV
+   - `list-runs`: View recent crawl runs and statistics
+   - `queue-status`: Monitor Redis queue depth and domain counts
+   - Supports prioritization based on domain rank
+
+7. **Crawl Run Tracking** ([crawler/spiders/discovery_spider.py](crawler/spiders/discovery_spider.py))
+   - Creates `crawl_runs` record on spider open
+   - Updates run status and statistics on spider close
+   - Links `crawl_log` entries to parent run via `crawl_run_id`
+
+8. **Scrapy-Native Image Downloads** ([processor/async_fetcher.py](processor/async_fetcher.py))
+   - `ScrapyImageDownloader`: Validates downloaded images from Scrapy responses
+   - Images downloaded through Scrapy request flow (respects politeness)
+   - `AsyncImageFetcher`: Alternative Twisted-based implementation (not currently used)
 
 ---
 
@@ -140,51 +165,89 @@ invisible-crawler/
 
 ---
 
-## Required to Run Domain-Seed Crawls (Now)
+## Required to Run (Phase 2)
 
-These items are required to run crawls against your **`config/test_seeds.txt`** domains and store results locally.
+### Prerequisites
 
-1. **Seed file must be non-empty**
-   - `config/test_seeds.txt` should contain one domain or URL per line.
-   - Lines may be plain domains; the spider will add `https://` when missing.
-   - Optional filters:
-     - `config/seed_allowlist.txt` (only these domains will be crawled)
-     - `config/seed_blocklist.txt` (these domains will be skipped)
-   - Optional runtime skips:
-     - `max_domain_errors` (default: 3) blocks a domain after repeated 403/429/503
-     - `block_on_login` (default: true) blocks domains that look like login pages
+1. **PostgreSQL database**
+   - `.env` must define `DATABASE_URL`
+   - Run `alembic upgrade head` before crawling
 
-2. **Database must be up and migrated**
-   - `.env` must define `DATABASE_URL`.
-   - Run `alembic upgrade head` before crawling.
+2. **Redis instance (Phase 2 mode)**
+   - `.env` must define `REDIS_URL` (default: `redis://localhost:6379/0`)
+   - Required when using Redis-based scheduling
+   - Verify availability: `python -c "from crawler.scheduler import check_redis_available; print(check_redis_available())"`
 
-3. **Crawl stop behavior must match your intent**
-   - Current default: `max_pages=10` stops the crawl after 10 pages total.
-   - If you want **"continue until stopped"**, decide one of:
-     - Pass a large `max_pages` value each run, or
-     - Change the spider to treat `max_pages=0` (or `None`) as "no limit."
+3. **Choose seed source**
+   - **File-based (Phase 1 compat)**: Provide `-a seeds=config/test_seeds.txt`
+   - **Redis-based (Phase 2)**: Ingest seeds via CLI first (see commands below)
 
-4. **Manual on-demand trigger**
-   - The crawler is run via Scrapy CLI and stops when the frontier is exhausted
-     (or when `max_pages` is reached).
+4. **Optional filters**
+   - `config/seed_allowlist.txt`: Only these domains will be crawled
+   - `config/seed_blocklist.txt`: These domains will be skipped
+   - Runtime skips:
+     - `max_domain_errors` (default: 3): Blocks domain after repeated 403/429/503
+     - `block_on_login` (default: true): Blocks domains that look like login pages
 
 ---
 
-## Local Runbook (On-Demand)
+## Local Runbook (Phase 2)
+
+### Installation
 
 ```bash
-# Install dependencies
+# Install dependencies (includes Redis client, scrapy-redis, etc.)
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
 
-# Configure database
-# Edit .env with DATABASE_URL
+# Configure database and Redis
+# Edit .env with DATABASE_URL and REDIS_URL
 
-# Apply schema
+# Apply schema migrations
 alembic upgrade head
+```
 
-# Run crawler against your test seeds
+### Option A: File-Based Seeds (Phase 1 Mode)
+
+```bash
+# Run crawler against local seed file
 scrapy crawl discovery -a seeds=config/test_seeds.txt -a max_pages=10000
+```
+
+### Option B: Redis-Based Seeds (Phase 2 Mode)
+
+```bash
+# Step 1: Start Redis
+docker run -d -p 6379:6379 redis:latest
+# OR: redis-server
+
+# Step 2: Ingest seeds from Tranco (or other source)
+python -m crawler.cli ingest-seeds --source tranco --limit 1000 --offset 0
+
+# Step 3: Check queue status
+python -m crawler.cli queue-status
+
+# Step 4: Run crawler (will consume from Redis start_urls)
+scrapy crawl discovery -a max_pages=10000
+
+# Step 5: Monitor crawl runs
+python -m crawler.cli list-runs --limit 10
+```
+
+### CLI Commands Reference
+
+```bash
+# Ingest seeds from Tranco
+python -m crawler.cli ingest-seeds --source tranco --limit 10000 --offset 0
+
+# Ingest seeds from custom CSV
+python -m crawler.cli ingest-seeds --source custom --file my_domains.csv --limit 5000
+
+# View queue status (start_urls, scheduled requests, domain counts)
+python -m crawler.cli queue-status
+
+# List recent crawl runs
+python -m crawler.cli list-runs --limit 10
 ```
 
 To stop the crawl, use `Ctrl+C`.
@@ -216,220 +279,131 @@ mypy crawler/ processor/ storage/
 
 ---
 
-## Known Gaps (Phase 1)
+## Known Gaps and Remaining Work (Phase 2)
 
-These are acceptable for Phase 1 but should be tracked:
+### Phase 2 Implementation Status
 
-1. **`crawl_log` is not written by crawler execution**
-   - Minimal per-page entries are now written by the spider (best-effort).
-   - No aggregation or run-level summaries yet.
+**Implemented:**
+- ✅ Redis-based URL frontier with priority queues
+- ✅ Seed ingestion CLI (Tranco, Majestic, custom CSV)
+- ✅ Crawl run tracking with database linkage
+- ✅ Scrapy-native image downloads (async, respects politeness)
+- ✅ Dual-mode seed sources (file or Redis)
 
-2. **Structured logging is not wired**
-   - `logging_config.py` provides formatters/stats but is not activated.
+**Remaining Gaps:**
 
-3. **Image fetcher uses `requests`**
-   - Image downloads bypass Scrapy’s robots/delay/retry controls.
-   - If strict politeness for images is required, refactor to Scrapy requests.
+1. **Perceptual hashes not computed**
+   - Schema includes `phash_hash` and `dhash_hash` columns
+   - `processor/fingerprint.py` has placeholder methods
+   - Pipeline doesn't call fingerprinting functions
+   - **Impact**: Similarity search not yet possible
+   - **Tracked for**: Future enhancement
 
----
+2. **No Redis connection fallback**
+   - Scheduler requires Redis when enabled
+   - No graceful degradation to memory scheduler
+   - **Impact**: Spider fails if Redis unavailable
+   - **Workaround**: Check Redis availability before starting crawl
+   - **Decision**: Accept hard dependency or implement fallback
 
-## Phase 1 Deep Notes (Current Behavior)
+3. **Crawl run images_downloaded not populated**
+   - Pipeline doesn't update `crawl_runs.images_downloaded`
+   - **Impact**: Incomplete run statistics
+   - **Tracked for**: Future enhancement
 
-1. **Data flow (detailed)**
-   - End-to-end path is: `Scrapy Spider -> Item Pipeline -> ImageFetcher -> PostgreSQL`.
-   - The spider parses HTML responses and yields image items with:
-     - `url`, `source_page`, `source_domain`, `type="image"`.
-   - The pipeline receives items and calls `ImageFetcher.fetch(url)`:
-     - Validates content-type, size, and dimensions.
-     - Computes SHA-256 for deduplication.
-   - Database writes:
-     - If `sha256_hash` already exists, update `images.last_seen_at`.
-     - Else insert new row in `images` and create a `provenance` row.
-   - Errors during fetch or DB write mark the item as failed and continue.
-   - In **discovery** mode, if the image URL already exists, the pipeline
-     skips re-download and only ensures provenance is present.
-   - Optional: set `DISCOVERY_REFRESH_AFTER_DAYS` to re-fetch if `last_seen_at`
-     is older than the threshold.
+4. **No tests for Phase 2 components**
+   - Redis scheduler integration not covered by tests
+   - CLI commands not tested
+   - Crawl run tracking not tested
+   - **Impact**: Regression risk, requires manual validation
+   - **Priority**: High
 
-```
-Spider (HTML) -> Image Item -> Pipeline -> Fetch + Validate -> Hash -> DB (images + provenance)
-```
+5. **AsyncImageFetcher is unused**
+   - `processor/async_fetcher.py::AsyncImageFetcher` is implemented but not wired
+   - `ScrapyImageDownloader` is used instead
+   - **Decision**: Remove or document as alternative implementation
 
-2. **Stopping conditions**
-   - Crawl stops when `max_pages` is reached or the frontier is exhausted.
-   - Default `max_pages=10` unless overridden via `-a max_pages=...`.
+6. **Object storage not implemented**
+   - Settings include MinIO/S3 placeholders
+   - No binary asset storage (only metadata)
+   - **Tracked for**: Phase 3
 
-3. **Logging**
-   - Basic logging via Scrapy defaults.
-   - Structured logging utilities exist but are not wired.
-
-4. **Database usage**
-   - `images` + `provenance` are written by the pipeline.
-   - `crawl_log` exists but is not written by runtime code.
-
-5. **Tests**
-   - Integration tests require a running PostgreSQL and migrations applied.
-   - Tests do not use `config/test_seeds.txt`.
+7. **Structured logging not activated**
+   - `crawler/logging_config.py` exists but not wired to spider/pipeline
+   - **Tracked for**: Future enhancement
 
 ---
 
-## Phase 2 Implementation Outline (Planned)
-
-1. **Seeds and Frontier**
-   - Ingest Tranco/other seed sources into a URL frontier.
-   - Introduce Redis-backed scheduler with per-domain queues and dedupe.
-
-2. **Crawl Strategy**
-   - Implement Scrapy broad crawl strategy for large-scale coverage.
-   - Add crawl modes: discovery vs refresh.
-
-3. **Runtime Topology**
-   - Local dev remains single-node.
-   - Remote deployment adds Redis + PostgreSQL + object storage.
-
-4. **Data Model Changes**
-   - Add frontier tables/queues or Redis schemas.
-   - Extend crawl metadata for queue state, retry/backoff, and refresh cadence.
-
-5. **Operational Controls**
-   - Config-driven rate limits per domain.
-   - Ability to start/stop/continue crawls on demand.
-
-6. **Acceptance Criteria**
-   - Seed ingestion produces scheduled URLs.
-   - Broad crawl runs for N domains without manual intervention.
-   - Queue + retry + backoff are observable and auditable.
-
----
-
-## Phase 2 Sketch: Async Fetching + Multi-Spider
-
-**Goal:** Keep the entire crawl pipeline non-blocking and allow multiple spiders to run concurrently.
-
-1. **Async image fetching (recommended)**
-   - Replace `requests` in the pipeline with Scrapy-native fetching:
-     - Option A: Use Scrapy `ImagesPipeline` and customize item fields.
-     - Option B: Yield image `Request` objects from the spider and handle in callbacks.
-   - Benefits:
-     - Uses Twisted reactor (non-blocking).
-     - Honors Scrapy politeness settings for images.
-     - Better throughput with controlled concurrency.
-
-2. **Run multiple spiders**
-   - **Single process**: use `CrawlerProcess` to run multiple spiders in one reactor.
-   - **Multi-process**: run separate Scrapy processes for isolation and scaling.
-   - Both approaches still integrate with Redis frontier (once added).
-
-3. **Concurrency knobs**
-   - Per-domain: `CONCURRENT_REQUESTS_PER_DOMAIN`, `DOWNLOAD_DELAY`
-   - Global: `CONCURRENT_REQUESTS`, `AUTOTHROTTLE_TARGET_CONCURRENCY`
-   - Image-specific throttling should match domain politeness.
-
-4. **Proposed implementation sequence**
-   - Introduce async image fetch path (ImagesPipeline or image requests).
-   - Validate equivalence of metadata writes and dedup logic.
-   - Add multi-spider launcher (process or multi-process).
-   - Connect to Redis frontier for shared queueing.
-
----
-
-## Next Steps (Phase 2 Reference)
-
-- Redis-backed URL frontier
-- Tranco seed ingestion
-- Scrapy broad crawls
-- Distributed scheduling and remote deployment
-
----
-
-## Phase 1 Code Review & Fixes Applied (2026-02-05)
-
-### Issues Identified
-
-#### Critical Issues
-
-| Issue | Location | Problem | Resolution |
-|-------|----------|---------|------------|
-| **Blocking I/O in Pipeline** | `crawler/pipelines.py` | `ImageFetcher` uses synchronous `requests` inside Scrapy's Twisted reactor, blocking the event loop | Documented as known gap; full fix deferred to Phase 2 (async fetching) |
-| **Missing perceptual hashes** | `processor/fingerprint.py` | `ImageFingerprinter` has pHash/dHash placeholder methods but pipeline doesn't compute them | Documented as Phase 2 enhancement |
-
-#### Moderate Issues (Fixed)
-
-| Issue | Location | Problem | Fix Applied |
-|-------|----------|---------|-------------|
-| **User-Agent mismatch** | `processor/fetcher.py` | Hardcoded User-Agent differs from Scrapy settings | Now reads from `CRAWLER_USER_AGENT` env var with fallback |
-| **`_is_valid_image_url` always returns True** | `crawler/spiders/discovery_spider.py` | Final `return True` made earlier validation dead code | Removed unconditional return; now actually filters |
-| **Connection pool not closed** | `storage/db.py` | `close_all_connections()` exists but isn't called on shutdown | Wired into `close_spider()` in pipeline |
-| **No explicit URL index** | Schema | `_get_existing_image_by_url` queries by URL | Added migration for explicit index (PostgreSQL creates implicit index on UNIQUE, but explicit is clearer) |
-
-#### Minor Issues (Documented)
-
-| Issue | Location | Notes |
-|-------|----------|-------|
-| Unused `normalized_hash` | `processor/fingerprint.py` | Reserved for Phase 2 perceptual hashing |
-| No retry for image fetch | `processor/fetcher.py` | Unlike Scrapy's retry middleware, fetcher has no retry logic; acceptable for Phase 1 |
-| `crawl_log.images_downloaded` not populated | `discovery_spider.py` | Pipeline doesn't update count; tracked for future enhancement |
-
-### Test Coverage Gaps (Tracked)
-
-| Gap | Status |
-|-----|--------|
-| No pipeline unit tests | Tracked for future |
-| No tests for blocklist/allowlist filtering | Tracked for future |
-| No tests for refresh mode `_should_refresh()` | Tracked for future |
-| Integration tests require live DB | Acceptable for Phase 1 |
-
----
-
-## Phase 2 Roadmap & Rationale
+## Phase 3 Roadmap (Future Work)
 
 ### High Priority
 
-| Improvement | Rationale |
-|-------------|-----------|
-| **Async image fetching via Scrapy** | Current `requests` blocks Twisted reactor. Use `scrapy.Request` for images or `ImagesPipeline` to honor politeness for image downloads. Unblocks throughput. |
-| **Redis URL frontier** | PostgreSQL isn't designed for high-throughput queue operations. Redis provides O(1) push/pop, natural TTL for retry backoff, and per-domain queue isolation. |
+| Improvement | Rationale | Status |
+|-------------|-----------|--------|
+| **Perceptual hash computation** | pHash/dHash enable similarity search for detecting re-encoded/cropped images. Compute during validation (cheap). | Schema ready, needs wiring |
+| **Object storage for binaries** | Currently only metadata is stored. Add MinIO/S3 backend for content-addressable binary storage `/{sha256[0:2]}/{sha256[2:4]}/{sha256}`. | Settings placeholders exist |
+| **Additional Phase 2 tests** | CLI integration tests, crawl run tracking tests, dual-mode seed tests. Some unit tests exist (test_scheduler.py), need integration coverage. | High priority |
+| **Distributed crawl mode** | Support `scrapyd` or multiple Scrapy instances sharing Redis queue for horizontal scaling. | Planning |
 
 ### Medium Priority
 
-| Improvement | Rationale |
-|-------------|-----------|
-| **Perceptual hash storage** | pHash/dHash enable similarity search for detecting re-encoded/cropped watermarked images. Compute during fetch (cheap) even if similarity index comes later. |
-| **Object storage for binaries** | Currently only metadata is stored. Add MinIO/S3 backend for content-addressable binary storage `/{sha256[0:2]}/{sha256[2:4]}/{sha256}`. |
-| **Distributed crawl mode** | Support `scrapyd` or `scrapy-redis` for horizontal scaling. Current single-process model won't scale. |
-| **Tranco seed ingestion** | `tranco_top1m.csv` exists but no ingestion code. Add CLI command to populate frontier from ranked seed lists. |
+| Improvement | Rationale | Status |
+|-------------|-----------|--------|
+| **Refresh crawl spider** | Separate spider for `discovery_type='refresh'` with different depth/politeness settings focusing on known URLs. | Planned |
+| **Metrics & observability** | Add Prometheus metrics exporter for crawl rate, error rate, queue depth. Current logging is basic. | Planned |
+| **Bloom filter for URL dedup** | For large-scale crawling, in-memory Bloom filter reduces DB lookups for already-seen URLs. | Research phase |
 
 ### Lower Priority
 
-| Improvement | Rationale |
-|-------------|-----------|
-| **Refresh crawl spider** | Separate spider for `discovery_type='refresh'` with different depth/politeness settings focusing on known URLs. |
-| **Bloom filter for URL dedup** | For large-scale crawling, in-memory Bloom filter reduces DB lookups for already-seen URLs. |
-| **Metrics & observability** | Add Prometheus metrics exporter for crawl rate, error rate, queue depth. Current logging is basic. |
+| Improvement | Rationale | Status |
+|-------------|-----------|--------|
+| **Structured logging activation** | Wire `logging_config.py` JSON formatter into spider/pipeline execution. | Enhancement |
+| **AsyncImageFetcher cleanup** | Either wire alternative Twisted-based fetcher or remove to reduce maintenance surface. | Cleanup |
+| **Crawl run images_downloaded stat** | Pipeline should increment `crawl_runs.images_downloaded` on successful stores. | Enhancement |
 
-### Schema Enhancements (Phase 2)
+---
 
-```sql
--- Add perceptual hashes
-ALTER TABLE images ADD COLUMN phash_hash VARCHAR(16);
-ALTER TABLE images ADD COLUMN dhash_hash VARCHAR(16);
-CREATE INDEX idx_images_phash ON images(phash_hash);
+## Phase 2 Implementation Notes (Current Behavior)
 
--- Add crawl run tracking
-CREATE TABLE crawl_runs (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMPTZ,
-    mode VARCHAR(20) NOT NULL,  -- 'discovery' | 'refresh'
-    pages_crawled INTEGER DEFAULT 0,
-    images_found INTEGER DEFAULT 0,
-    images_downloaded INTEGER DEFAULT 0,
-    seed_source VARCHAR(255)
-);
+### Data Flow (Detailed)
 
--- Link crawl_log to runs
-ALTER TABLE crawl_log ADD COLUMN crawl_run_id UUID REFERENCES crawl_runs(id);
 ```
+Spider parses HTML
+   ↓
+Spider yields image Request(callback=parse_image)
+   ↓
+Scrapy downloads image (respects politeness)
+   ↓
+parse_image callback receives Response
+   ↓
+Callback yields item with Response attached
+   ↓
+Pipeline receives item
+   ↓
+Pipeline validates Response via ScrapyImageDownloader
+   ↓
+Pipeline computes SHA-256 hash
+   ↓
+Pipeline checks for existing image (dedup)
+   ↓
+Pipeline stores/updates metadata in PostgreSQL
+   ↓
+Pipeline ensures provenance record
+```
+
+### Redis Queue Structure
+
+- **`{spider}:start_urls`**: Sorted set (score = priority) containing seed URLs ingested via CLI
+- **`{spider}:requests`**: Sorted set containing scheduled requests from crawl
+- **`{spider}:dupefilter`**: Set for URL deduplication
+- **`{spider}:domains`**: Set tracking unique domains encountered
+- **`{spider}:requests:domain_counts`**: Hash tracking per-domain request counts
+
+### Stopping Conditions
+
+- Crawl stops when `max_pages` is reached OR queue is exhausted
+- Default `max_pages=10` unless overridden via `-a max_pages=...`
+- Redis queues persist across runs unless `SCHEDULER_FLUSH_ON_START=True`
 
 ---
 
@@ -438,7 +412,55 @@ ALTER TABLE crawl_log ADD COLUMN crawl_run_id UUID REFERENCES crawl_runs(id);
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgresql://localhost/invisible` | PostgreSQL connection string |
-| `CRAWLER_USER_AGENT` | `InvisibleCrawler/0.1 (...)` | User-Agent for image fetching |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection string (Phase 2) |
+| `CRAWLER_USER_AGENT` | `InvisibleCrawler/0.1 (...)` | User-Agent for HTTP requests |
 | `DISCOVERY_REFRESH_AFTER_DAYS` | `0` (disabled) | Re-fetch images older than N days |
 | `IMAGE_MIN_WIDTH` | `256` | Minimum image width in pixels |
 | `IMAGE_MIN_HEIGHT` | `256` | Minimum image height in pixels |
+
+---
+
+## Phase 2 Fixes Applied (2026-02-05)
+
+### Critical Fixes
+
+| Issue | Resolution |
+|-------|------------|
+| **Broken image pipeline** | Refactored: spider yields image Requests with callbacks; pipeline processes downloaded items (not Requests) |
+| **Priority ignored in Redis queue** | Fixed `DomainPriorityQueue.push` to pass priority parameter to parent class |
+
+### High Priority Fixes
+
+| Issue | Resolution |
+|-------|------------|
+| **False Redis fallback claim** | Removed misleading comment; documented hard Redis dependency |
+| **Seed ingestion not wired** | Spider now checks Redis start_urls first, falls back to file seeds |
+| **Queue status reports wrong keys** | CLI now reports both start_urls (seeds) and requests (queue) |
+
+### Moderate Priority Fixes
+
+| Issue | Resolution |
+|-------|------------|
+| **Crawl runs unused** | Wired spider to create/update crawl_runs; crawl_log entries now link via crawl_run_id |
+| **Schema out of sync** | Updated schema.sql to include crawl_runs, perceptual hashes, and all Phase 2 columns |
+| **IMPLEMENTATION.md outdated** | Updated to reflect Phase 2 implementation status and usage |
+
+---
+
+## Testing Strategy (Updated for Phase 2)
+
+### Existing Tests
+- **Test count**: 52 test functions across 5 test files
+- **Coverage**: Unit tests for processor, fetcher, spider parsing; integration tests for pipeline
+- **Redis scheduler**: 8 tests in test_scheduler.py (mock Redis client, priority handling, queue operations)
+- **Async fetcher**: 12 tests in test_async_fetcher.py
+- **Integration**: 7 tests in test_integration.py (requires PostgreSQL)
+
+### Additional Tests Needed (Phase 2 Gaps)
+- **CLI commands**: Test seed ingestion, queue status, list-runs end-to-end
+- **Crawl run tracking**: Integration test verifying run creation and linkage with actual spider
+- **Image download flow**: Full spider → callback → pipeline integration test
+- **Dual-mode seeds**: Test Redis vs file fallback behavior
+- **Phase 2 regressions**: Expanded test coverage for refactored pipeline
+
+---
