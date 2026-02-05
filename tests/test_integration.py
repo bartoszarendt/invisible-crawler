@@ -101,7 +101,8 @@ class TestIntegrationPipeline:
         result = fetcher.fetch(httpserver.url_for("/small-image.jpg"))
 
         assert result.success is False
-        assert "too small" in result.error_message.lower()
+        # Image is rejected because file size (825 bytes) < min_file_size (1024 bytes)
+        assert "file_too_small" in result.error_message.lower()
 
     def test_database_storage_after_fetch(
         self, httpserver: HTTPServer, create_test_image: callable

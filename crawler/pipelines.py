@@ -13,6 +13,16 @@ from scrapy.spiders import Spider
 
 from processor.async_fetcher import ScrapyImageDownloader
 from processor.fetcher import ImageFetcher, ImageFetchResult
+from processor.media_policy import (
+    REJECTION_REASON_FILE_TOO_LARGE,
+    REJECTION_REASON_FILE_TOO_SMALL,
+    REJECTION_REASON_HTTP_ERROR,
+    REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL,
+    REJECTION_REASON_INVALID_IMAGE_PAYLOAD,
+    REJECTION_REASON_MISSING_CONTENT_TYPE,
+    REJECTION_REASON_MISSING_RESPONSE,
+    REJECTION_REASON_UNSUPPORTED_CONTENT_TYPE,
+)
 from storage.db import get_cursor
 
 logger = logging.getLogger(__name__)
@@ -41,6 +51,17 @@ class ImageProcessingPipeline:
             "images_failed": 0,
             "images_deduplicated": 0,
             "total_bytes_downloaded": 0,
+        }
+        # Rejection reason counters (structured metrics)
+        self.rejection_stats: dict[str, int] = {
+            REJECTION_REASON_UNSUPPORTED_CONTENT_TYPE: 0,
+            REJECTION_REASON_MISSING_CONTENT_TYPE: 0,
+            REJECTION_REASON_FILE_TOO_SMALL: 0,
+            REJECTION_REASON_FILE_TOO_LARGE: 0,
+            REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL: 0,
+            REJECTION_REASON_INVALID_IMAGE_PAYLOAD: 0,
+            REJECTION_REASON_HTTP_ERROR: 0,
+            REJECTION_REASON_MISSING_RESPONSE: 0,
         }
         self.downloader: ScrapyImageDownloader | None = None
         self.sync_fetcher: ImageFetcher | None = None
@@ -73,6 +94,17 @@ class ImageProcessingPipeline:
             "images_deduplicated": 0,
             "total_bytes_downloaded": 0,
         }
+        # Reset rejection counters
+        self.rejection_stats = {
+            REJECTION_REASON_UNSUPPORTED_CONTENT_TYPE: 0,
+            REJECTION_REASON_MISSING_CONTENT_TYPE: 0,
+            REJECTION_REASON_FILE_TOO_SMALL: 0,
+            REJECTION_REASON_FILE_TOO_LARGE: 0,
+            REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL: 0,
+            REJECTION_REASON_INVALID_IMAGE_PAYLOAD: 0,
+            REJECTION_REASON_HTTP_ERROR: 0,
+            REJECTION_REASON_MISSING_RESPONSE: 0,
+        }
         # Use async downloader that integrates with Scrapy
         self.downloader = ScrapyImageDownloader()
         # Keep sync fetcher for testing/standalone use
@@ -96,6 +128,10 @@ class ImageProcessingPipeline:
         logger.info("ImageProcessingPipeline Statistics:")
         for key, value in self.stats.items():
             logger.info(f"  {key}: {value}")
+        logger.info("Rejection Reasons:")
+        for reason, count in self.rejection_stats.items():
+            if count > 0:
+                logger.info(f"  {reason}: {count}")
         logger.info("=" * 50)
 
     def process_item(self, item: dict[str, Any], spider: Spider) -> Any:
@@ -127,6 +163,7 @@ class ImageProcessingPipeline:
 
         if not response:
             self.stats["images_failed"] += 1
+            self._increment_rejection_reason(REJECTION_REASON_MISSING_RESPONSE)
             logger.error(f"Image item missing response: {url}")
             raise DropItem("Missing response object")
 
@@ -149,6 +186,8 @@ class ImageProcessingPipeline:
 
         if not fetch_result.success:
             self.stats["images_failed"] += 1
+            # Classify and count rejection reason
+            self._classify_and_count_rejection(fetch_result.error_message)
             logger.warning(f"Failed to validate image {url}: {fetch_result.error_message}")
             raise DropItem(f"Image validation failed: {fetch_result.error_message}")
 
@@ -159,6 +198,8 @@ class ImageProcessingPipeline:
                 source_page=source_page,
                 source_domain=source_domain,
                 fetch_result=fetch_result,
+                crawl_run_id=item.get("crawl_run_id"),
+                crawl_type=crawl_type,
             )
 
             if result["status"] == "downloaded":
@@ -180,6 +221,8 @@ class ImageProcessingPipeline:
         source_page: str,
         source_domain: str,
         fetch_result: ImageFetchResult,
+        crawl_run_id: Any = None,
+        crawl_type: str = "discovery",
     ) -> dict[str, Any]:
         """Store image metadata in the database.
 
@@ -188,68 +231,134 @@ class ImageProcessingPipeline:
             source_page: Page where image was found.
             source_domain: Domain of source page.
             fetch_result: ImageFetchResult with image data.
+            crawl_run_id: Optional crawl run ID for stats tracking.
+            crawl_type: Type of crawl (discovery or refresh).
 
         Returns:
             Dictionary with storage result.
         """
         try:
             with get_cursor() as cursor:
-                # Check if image already exists by SHA-256 hash
+                # First check by URL to handle URL/hash conflicts properly
                 cursor.execute(
-                    "SELECT id FROM images WHERE sha256_hash = %s", (fetch_result.sha256_hash,)
+                    "SELECT id, sha256_hash FROM images WHERE url = %s", (url,)
                 )
-                existing = cursor.fetchone()
+                url_existing = cursor.fetchone()
 
-                if existing:
-                    # Image already exists (exact duplicate)
-                    image_id = existing[0]
-
-                    # Update last_seen timestamp
-                    cursor.execute(
-                        "UPDATE images SET last_seen_at = CURRENT_TIMESTAMP WHERE id = %s",
-                        (image_id,),
-                    )
-
-                    logger.debug(f"Image already exists (hash match): {url} -> {image_id}")
-                    status = "deduplicated"
-                else:
-                    # Insert new image record
-                    cursor.execute(
-                        """
-                        INSERT INTO images (
-                            url, sha256_hash, width, height, format,
-                            content_type, file_size_bytes, download_success,
-                            phash_hash, dhash_hash
+                if url_existing:
+                    # URL exists - check if hash changed (refresh scenario)
+                    existing_id, existing_hash = url_existing
+                    if existing_hash == fetch_result.sha256_hash:
+                        # Same URL, same hash - just update last_seen
+                        cursor.execute(
+                            "UPDATE images SET last_seen_at = CURRENT_TIMESTAMP WHERE id = %s",
+                            (existing_id,),
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        RETURNING id
-                        """,
-                        (
-                            url,
-                            fetch_result.sha256_hash,
-                            fetch_result.width,
-                            fetch_result.height,
-                            fetch_result.format,
-                            fetch_result.content_type,
-                            fetch_result.file_size,
-                            True,
-                            fetch_result.phash_hash,
-                            fetch_result.dhash_hash,
-                        ),
+                        image_id = existing_id
+                        status = "deduplicated"
+                    else:
+                        # Same URL, different hash - update metadata (content changed)
+                        cursor.execute(
+                            """
+                            UPDATE images
+                            SET sha256_hash = %s,
+                                width = %s,
+                                height = %s,
+                                format = %s,
+                                content_type = %s,
+                                file_size_bytes = %s,
+                                phash_hash = %s,
+                                dhash_hash = %s,
+                                last_seen_at = CURRENT_TIMESTAMP
+                            WHERE id = %s
+                            """,
+                            (
+                                fetch_result.sha256_hash,
+                                fetch_result.width,
+                                fetch_result.height,
+                                fetch_result.format,
+                                fetch_result.content_type,
+                                fetch_result.file_size,
+                                fetch_result.phash_hash,
+                                fetch_result.dhash_hash,
+                                existing_id,
+                            ),
+                        )
+                        image_id = existing_id
+                        status = "downloaded"  # Count as new download since content changed
+                        logger.info(f"Updated image with changed hash: {url} -> {image_id}")
+                else:
+                    # Check if image exists by hash (different URL, same content)
+                    cursor.execute(
+                        "SELECT id FROM images WHERE sha256_hash = %s", (fetch_result.sha256_hash,)
                     )
-                    image_id = cursor.fetchone()[0]
-                    logger.debug(f"Inserted new image: {url} -> {image_id}")
-                    status = "downloaded"
+                    hash_existing = cursor.fetchone()
+
+                    if hash_existing:
+                        # Different URL, same hash - just link provenance
+                        image_id = hash_existing[0]
+                        cursor.execute(
+                            "UPDATE images SET last_seen_at = CURRENT_TIMESTAMP WHERE id = %s",
+                            (image_id,),
+                        )
+                        status = "deduplicated"
+                        logger.debug(f"Image exists with different URL (hash match): {url} -> {image_id}")
+                    else:
+                        # Completely new image
+                        cursor.execute(
+                            """
+                            INSERT INTO images (
+                                url, sha256_hash, width, height, format,
+                                content_type, file_size_bytes, download_success,
+                                phash_hash, dhash_hash
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (
+                                url,
+                                fetch_result.sha256_hash,
+                                fetch_result.width,
+                                fetch_result.height,
+                                fetch_result.format,
+                                fetch_result.content_type,
+                                fetch_result.file_size,
+                                True,
+                                fetch_result.phash_hash,
+                                fetch_result.dhash_hash,
+                            ),
+                        )
+                        image_id = cursor.fetchone()[0]
+                        status = "downloaded"
+                        logger.debug(f"Inserted new image: {url} -> {image_id}")
 
                 # Add provenance record within same transaction
                 cursor.execute(
                     """
-                    INSERT INTO provenance (image_id, source_page_url, source_domain)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (image_id, source_page_url) DO NOTHING
+                    INSERT INTO provenance (image_id, source_page_url, source_domain, discovery_type)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (image_id, source_page_url) DO UPDATE
+                    SET discovered_at = CURRENT_TIMESTAMP,
+                        discovery_type = EXCLUDED.discovery_type
                     """,
-                    (image_id, source_page, source_domain),
+                    (image_id, source_page, source_domain, crawl_type),
                 )
+
+                # Increment crawl_log.images_downloaded for this page (if crawl_run_id provided)
+                if crawl_run_id and status == "downloaded":
+                    cursor.execute(
+                        """
+                        UPDATE crawl_log
+                        SET images_downloaded = images_downloaded + 1
+                        WHERE page_url = %s AND crawl_run_id = %s
+                        """,
+                        (source_page, crawl_run_id),
+                    )
+                    rows_updated = cursor.rowcount
+                    if rows_updated == 0:
+                        logger.debug(
+                            f"No crawl_log entry found for page {source_page} (run {crawl_run_id})"
+                        )
 
                 return {
                     "status": status,
@@ -291,11 +400,13 @@ class ImageProcessingPipeline:
 
                 cursor.execute(
                     """
-                    INSERT INTO provenance (image_id, source_page_url, source_domain)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (image_id, source_page_url) DO NOTHING
+                    INSERT INTO provenance (image_id, source_page_url, source_domain, discovery_type)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (image_id, source_page_url) DO UPDATE
+                    SET discovered_at = CURRENT_TIMESTAMP,
+                        discovery_type = EXCLUDED.discovery_type
                     """,
-                    (image_id, source_page, source_domain),
+                    (image_id, source_page, source_domain, "discovery"),
                 )
                 logger.debug(f"Successfully inserted provenance for image {image_id}")
         except Exception as e:
@@ -308,6 +419,66 @@ class ImageProcessingPipeline:
             return False
         threshold = datetime.now(UTC) - timedelta(days=self.discovery_refresh_after_days)
         return last_seen_at < threshold
+
+    def _increment_rejection_reason(self, reason: str) -> None:
+        """Increment rejection counter for a specific reason.
+
+        Args:
+            reason: Structured rejection reason constant.
+        """
+        if reason in self.rejection_stats:
+            self.rejection_stats[reason] += 1
+        else:
+            # Track unknown reasons as well
+            self.rejection_stats[reason] = 1
+            logger.debug(f"New rejection reason tracked: {reason}")
+
+    def _classify_and_count_rejection(self, error_message: str | None) -> None:
+        """Classify and count rejection reason from error message.
+
+        Parses structured error messages like 'unsupported_content_type: image/svg+xml'
+        and increments the appropriate counter.
+
+        Args:
+            error_message: Error message from fetch result.
+        """
+        if not error_message:
+            self._increment_rejection_reason("unknown")
+            return
+
+        # Extract structured reason (format: "reason: details")
+        parts = error_message.split(":", 1)
+        reason = parts[0].strip().lower()
+
+        # Map to known rejection reasons
+        known_reasons = {
+            REJECTION_REASON_UNSUPPORTED_CONTENT_TYPE,
+            REJECTION_REASON_MISSING_CONTENT_TYPE,
+            REJECTION_REASON_FILE_TOO_SMALL,
+            REJECTION_REASON_FILE_TOO_LARGE,
+            REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL,
+            REJECTION_REASON_INVALID_IMAGE_PAYLOAD,
+            REJECTION_REASON_HTTP_ERROR,
+            REJECTION_REASON_MISSING_RESPONSE,
+        }
+
+        if reason in known_reasons:
+            self._increment_rejection_reason(reason)
+        else:
+            # Fallback: try to infer from message
+            msg_lower = error_message.lower()
+            if "content type" in msg_lower or "content-type" in msg_lower:
+                self._increment_rejection_reason(REJECTION_REASON_UNSUPPORTED_CONTENT_TYPE)
+            elif "too small" in msg_lower and "dimension" in msg_lower:
+                self._increment_rejection_reason(REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL)
+            elif "too small" in msg_lower:
+                self._increment_rejection_reason(REJECTION_REASON_FILE_TOO_SMALL)
+            elif "too large" in msg_lower:
+                self._increment_rejection_reason(REJECTION_REASON_FILE_TOO_LARGE)
+            elif "http" in msg_lower or "status" in msg_lower:
+                self._increment_rejection_reason(REJECTION_REASON_HTTP_ERROR)
+            else:
+                self._increment_rejection_reason("unknown")
 
 
 def _get_int_env(name: str, default: int) -> int:

@@ -71,7 +71,7 @@ pytest tests/ --cov=crawler --cov=processor --cov-report=term-missing
 ## Documentation
 
 * [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) – Architecture and design principles
-* [IMPLEMENTATION.md](IMPLEMENTATION.md) – Phase 1 implementation details and Phase 2 roadmap
+* [IMPLEMENTATION.md](IMPLEMENTATION.md) – Phase 2 implementation details, runbook, and known gaps
 * [AGENTS.md](AGENTS.md) – Agent guidelines and project conventions
 
 ## License

@@ -12,6 +12,16 @@ from io import BytesIO
 import requests
 from PIL import Image
 
+from processor.media_policy import (
+    REJECTION_REASON_FILE_TOO_LARGE,
+    REJECTION_REASON_FILE_TOO_SMALL,
+    REJECTION_REASON_HTTP_ERROR,
+    REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL,
+    REJECTION_REASON_INVALID_IMAGE_PAYLOAD,
+    format_rejection_reason,
+    validate_content_type,
+)
+
 logger = logging.getLogger(__name__)
 
 # User-Agent can be configured via environment variable for consistency with Scrapy settings
@@ -69,17 +79,7 @@ class ImageFetcher:
         session: Reusable requests Session for connection pooling.
     """
 
-    # Allowed content types
-    ALLOWED_CONTENT_TYPES = {
-        "image/jpeg",
-        "image/jpg",
-        "image/png",
-        "image/gif",
-        "image/webp",
-        "image/svg+xml",
-        "image/bmp",
-        "image/tiff",
-    }
+    # Removed: ALLOWED_CONTENT_TYPES now imported from media_policy
 
     def __init__(
         self,
@@ -134,34 +134,37 @@ class ImageFetcher:
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message="Request timeout",
+                error_message=format_rejection_reason(REJECTION_REASON_HTTP_ERROR, "timeout"),
             )
         except requests.exceptions.ConnectionError as e:
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message=f"Connection error: {e}",
+                error_message=format_rejection_reason(REJECTION_REASON_HTTP_ERROR, f"connection_error: {type(e).__name__}"),
             )
         except requests.exceptions.HTTPError as e:
+            # Extract status code if available
+            status = getattr(e.response, "status_code", "unknown") if hasattr(e, "response") else "unknown"
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message=f"HTTP error: {e}",
+                error_message=format_rejection_reason(REJECTION_REASON_HTTP_ERROR, f"status_{status}"),
             )
         except requests.exceptions.RequestException as e:
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message=f"Request failed: {e}",
+                error_message=format_rejection_reason(REJECTION_REASON_HTTP_ERROR, f"request_exception: {type(e).__name__}"),
             )
 
-        # Validate content type
-        content_type = response.headers.get("Content-Type", "").lower().split(";")[0]
-        if content_type and content_type not in self.ALLOWED_CONTENT_TYPES:
+        # Validate content type (strict: reject if missing or unsupported)
+        content_type = response.headers.get("Content-Type", "")
+        is_valid, error_reason = validate_content_type(content_type)
+        if not is_valid:
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message=f"Invalid content type: {content_type}",
+                error_message=error_reason,
             )
 
         # Check file size from headers (if available)
@@ -172,13 +175,13 @@ class ImageFetcher:
                 return ImageFetchResult(
                     success=False,
                     url=url,
-                    error_message=f"File too small: {file_size} bytes",
+                    error_message=format_rejection_reason(REJECTION_REASON_FILE_TOO_SMALL, f"{file_size} bytes"),
                 )
             if file_size > self.max_file_size:
                 return ImageFetchResult(
                     success=False,
                     url=url,
-                    error_message=f"File too large: {file_size} bytes",
+                    error_message=format_rejection_reason(REJECTION_REASON_FILE_TOO_LARGE, f"{file_size} bytes"),
                 )
 
         # Read content with size validation
@@ -196,23 +199,30 @@ class ImageFetcher:
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message=f"File too small: {len(content)} bytes",
+                error_message=format_rejection_reason(REJECTION_REASON_FILE_TOO_SMALL, f"{len(content)} bytes"),
             )
 
         # Generate SHA-256 hash
         sha256_hash = hashlib.sha256(content).hexdigest()
 
-        # Parse image dimensions
+        # Parse image dimensions and validate payload
         width, height, img_format = self._parse_image_dimensions(content)
 
-        # Validate dimensions if parseable
-        if width and height:
-            if width < self.min_dimensions[0] or height < self.min_dimensions[1]:
-                return ImageFetchResult(
-                    success=False,
-                    url=url,
-                    error_message=f"Image too small: {width}x{height}",
-                )
+        # If we cannot parse dimensions, reject as invalid payload
+        if width is None or height is None:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=format_rejection_reason(REJECTION_REASON_INVALID_IMAGE_PAYLOAD, "cannot parse dimensions"),
+            )
+
+        # Validate dimensions
+        if width < self.min_dimensions[0] or height < self.min_dimensions[1]:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=format_rejection_reason(REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL, f"{width}x{height}"),
+            )
 
         logger.debug(f"Successfully fetched image: {url} ({len(content)} bytes)")
 

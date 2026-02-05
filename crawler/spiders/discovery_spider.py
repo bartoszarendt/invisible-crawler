@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlparse
 from scrapy import Spider, signals
 from scrapy.http import Request, Response, TextResponse
 
+from processor.media_policy import ALLOWED_EXTENSIONS
 from storage.db import get_cursor
 
 
@@ -67,10 +68,10 @@ class DiscoverySpider(Spider):
                     VALUES (%s, %s, %s)
                     RETURNING id
                     """,
-                    ("discovery", "running", self.seeds_file or "redis"),
+                    (self.crawl_type, "running", self.seeds_file or "redis"),
                 )
                 self.crawl_run_id = cursor.fetchone()[0]
-                self.logger.info(f"Created crawl run: {self.crawl_run_id}")
+                self.logger.info(f"Created crawl run: {self.crawl_run_id} (mode: {self.crawl_type})")
         except Exception as e:
             self.logger.warning(f"Failed to create crawl run: {e}")
             self.crawl_run_id = None
@@ -89,8 +90,10 @@ class DiscoverySpider(Spider):
         self.blocklist_file = kwargs.get("blocklist", "config/seed_blocklist.txt")
         self.max_domain_errors = _get_int(kwargs.get("max_domain_errors"), 3)
         self.block_on_login = _get_bool(kwargs.get("block_on_login"), True)
+        self.crawl_type = kwargs.get("crawl_type", "discovery")  # 'discovery' or 'refresh'
         self.images_found: int = 0
         self.pages_crawled: int = 0
+        self.images_downloaded: int = 0  # Track successful downloads for crawl_runs
         self.crawl_run_id: Any = None  # Track current crawl run
         self._domains: list[str] = []
         self._allowlist = self._load_domain_list(self.allowlist_file)
@@ -257,6 +260,7 @@ class DiscoverySpider(Spider):
             domain=current_domain,
             status=response.status,
             images_found=len(image_urls),
+            crawl_type=self.crawl_type,
         )
 
         # Yield image download requests with callback
@@ -268,7 +272,8 @@ class DiscoverySpider(Spider):
                 meta={
                     "source_page": response.url,
                     "source_domain": current_domain,
-                    "crawl_type": "discovery",
+                    "crawl_type": self.crawl_type,  # Propagate actual crawl type
+                    "crawl_run_id": self.crawl_run_id,  # Pass run ID for stats tracking
                 },
                 priority=response.meta.get("depth", 0) + 1,  # Lower priority than page crawling
                 dont_filter=False,
@@ -408,18 +413,19 @@ class DiscoverySpider(Spider):
         if not parsed.scheme or not parsed.netloc:
             return False
 
-        # Check for common image extensions
-        image_extensions = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp")
+        # Check for allowed image extensions (only JPEG, PNG, WEBP)
         path_lower = parsed.path.lower()
 
-        if any(path_lower.endswith(ext) for ext in image_extensions):
+        # Strict extension check only - no heuristics
+        if any(path_lower.endswith(ext) for ext in ALLOWED_EXTENSIONS):
             return True
 
-        # Allow URLs that look like images even without extension
-        if "image" in path_lower or "/img/" in path_lower:
+        # Also check if query string contains valid extension (e.g., ?file=image.jpg)
+        query_lower = parsed.query.lower()
+        if any(ext in query_lower for ext in ALLOWED_EXTENSIONS):
             return True
 
-        # Reject URLs that don't look like images
+        # Reject URLs that don't have explicit allowed extensions
         return False
 
     def _load_domain_list(self, path: str | None) -> set[str]:
@@ -481,6 +487,7 @@ class DiscoverySpider(Spider):
         source_page = meta.get("source_page", "")
         source_domain = meta.get("source_domain", "")
         crawl_type = meta.get("crawl_type", "discovery")
+        crawl_run_id = meta.get("crawl_run_id")
 
         # Yield item with response for pipeline to process
         yield {
@@ -489,6 +496,7 @@ class DiscoverySpider(Spider):
             "source_page": source_page,
             "source_domain": source_domain,
             "crawl_type": crawl_type,
+            "crawl_run_id": crawl_run_id,  # Pass for pipeline stats
             "response": response,  # Attach response for pipeline processing
         }
 
@@ -537,6 +545,7 @@ class DiscoverySpider(Spider):
             status=status,
             images_found=0,
             error_message=failure.getErrorMessage(),
+            crawl_type=self.crawl_type,
         )
 
     def closed(self, reason: str) -> None:
@@ -549,18 +558,41 @@ class DiscoverySpider(Spider):
         if self.crawl_run_id:
             try:
                 with get_cursor() as cursor:
+                    # Calculate actual images_downloaded from crawl_log
+                    cursor.execute(
+                        """
+                        SELECT COALESCE(SUM(images_downloaded), 0)
+                        FROM crawl_log
+                        WHERE crawl_run_id = %s
+                        """,
+                        (self.crawl_run_id,),
+                    )
+                    total_downloaded = cursor.fetchone()[0]
+                    # Update spider counter to match DB value for logging
+                    self.images_downloaded = total_downloaded
+
                     cursor.execute(
                         """
                         UPDATE crawl_runs
                         SET completed_at = CURRENT_TIMESTAMP,
                             status = %s,
                             pages_crawled = %s,
-                            images_found = %s
+                            images_found = %s,
+                            images_downloaded = %s
                         WHERE id = %s
                         """,
-                        ("completed" if reason == "finished" else "failed", self.pages_crawled, self.images_found, self.crawl_run_id),
+                        (
+                            "completed" if reason == "finished" else "failed",
+                            self.pages_crawled,
+                            self.images_found,
+                            total_downloaded,
+                            self.crawl_run_id,
+                        ),
                     )
-                    self.logger.info(f"Updated crawl run: {self.crawl_run_id}")
+                    if cursor.rowcount == 0:
+                        self.logger.warning(f"Failed to update crawl_run {self.crawl_run_id}: row not found")
+                    else:
+                        self.logger.info(f"Updated crawl run: {self.crawl_run_id} (images_downloaded: {total_downloaded})")
             except Exception as e:
                 self.logger.warning(f"Failed to update crawl run: {e}")
 
@@ -568,6 +600,7 @@ class DiscoverySpider(Spider):
         self.logger.info(f"Spider closed: {reason}")
         self.logger.info(f"Pages crawled: {self.pages_crawled}")
         self.logger.info(f"Images found: {self.images_found}")
+        self.logger.info(f"Images downloaded: {self.images_downloaded}")
         self.logger.info("=" * 50)
 
     def _log_crawl_entry(
@@ -577,6 +610,7 @@ class DiscoverySpider(Spider):
         status: int | None,
         images_found: int,
         error_message: str | None = None,
+        crawl_type: str = "discovery",
     ) -> None:
         """Write a minimal crawl_log entry (best-effort).
 
@@ -598,7 +632,7 @@ class DiscoverySpider(Spider):
                         status,
                         images_found,
                         error_message,
-                        "discovery",
+                        crawl_type,
                         self.crawl_run_id,
                     ),
                 )

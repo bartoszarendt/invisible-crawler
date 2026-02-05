@@ -17,6 +17,15 @@ from twisted.web.http_headers import Headers
 
 from processor.fetcher import ImageFetchResult
 from processor.fingerprint import ImageFingerprinter
+from processor.media_policy import (
+    REJECTION_REASON_FILE_TOO_LARGE,
+    REJECTION_REASON_FILE_TOO_SMALL,
+    REJECTION_REASON_HTTP_ERROR,
+    REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL,
+    REJECTION_REASON_INVALID_IMAGE_PAYLOAD,
+    format_rejection_reason,
+    validate_content_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,17 +44,7 @@ class AsyncImageFetcher:
         agent: Twisted Agent for HTTP requests.
     """
 
-    # Allowed content types
-    ALLOWED_CONTENT_TYPES = {
-        "image/jpeg",
-        "image/jpg",
-        "image/png",
-        "image/gif",
-        "image/webp",
-        "image/svg+xml",
-        "image/bmp",
-        "image/tiff",
-    }
+    # Removed: ALLOWED_CONTENT_TYPES now imported from media_policy
 
     def __init__(
         self,
@@ -92,7 +91,7 @@ class AsyncImageFetcher:
                 ImageFetchResult(
                     success=False,
                     url=url,
-                    error_message="Request timeout",
+                    error_message=format_rejection_reason(REJECTION_REASON_HTTP_ERROR, "timeout"),
                 )
             )
             return
@@ -101,7 +100,7 @@ class AsyncImageFetcher:
                 ImageFetchResult(
                     success=False,
                     url=url,
-                    error_message=f"Request failed: {e}",
+                    error_message=format_rejection_reason(REJECTION_REASON_HTTP_ERROR, f"request_exception: {type(e).__name__}"),
                 )
             )
             return
@@ -112,24 +111,24 @@ class AsyncImageFetcher:
                 ImageFetchResult(
                     success=False,
                     url=url,
-                    error_message=f"HTTP error: {response.code}",
+                    error_message=format_rejection_reason(REJECTION_REASON_HTTP_ERROR, f"status_{response.code}"),
                 )
             )
             return
 
-        # Validate content type from headers
+        # Validate content type from headers (strict: reject if missing or unsupported)
         content_type_headers = response.headers.getRawHeaders(b"Content-Type", [])
         content_type = ""
         if content_type_headers:
-            content_type = content_type_headers[0].decode("utf-8", errors="ignore").lower()
-            content_type = content_type.split(";")[0].strip()
+            content_type = content_type_headers[0].decode("utf-8", errors="ignore")
 
-        if content_type and content_type not in self.ALLOWED_CONTENT_TYPES:
+        is_valid, error_reason = validate_content_type(content_type)
+        if not is_valid:
             defer.returnValue(
                 ImageFetchResult(
                     success=False,
                     url=url,
-                    error_message=f"Invalid content type: {content_type}",
+                    error_message=error_reason,
                 )
             )
             return
@@ -154,7 +153,7 @@ class AsyncImageFetcher:
                 ImageFetchResult(
                     success=False,
                     url=url,
-                    error_message=f"File too small: {file_size} bytes",
+                    error_message=format_rejection_reason(REJECTION_REASON_FILE_TOO_SMALL, f"{file_size} bytes"),
                 )
             )
             return
@@ -164,7 +163,7 @@ class AsyncImageFetcher:
                 ImageFetchResult(
                     success=False,
                     url=url,
-                    error_message=f"File too large: {file_size} bytes",
+                    error_message=format_rejection_reason(REJECTION_REASON_FILE_TOO_LARGE, f"{file_size} bytes"),
                 )
             )
             return
@@ -172,20 +171,30 @@ class AsyncImageFetcher:
         # Generate SHA-256 hash
         sha256_hash = hashlib.sha256(body).hexdigest()
 
-        # Parse image dimensions
+        # Parse image dimensions and validate payload
         width, height, img_format = self._parse_image_dimensions(body)
 
-        # Validate dimensions if parseable
-        if width and height:
-            if width < self.min_dimensions[0] or height < self.min_dimensions[1]:
-                defer.returnValue(
-                    ImageFetchResult(
-                        success=False,
-                        url=url,
-                        error_message=f"Image too small: {width}x{height}",
-                    )
+        # If we cannot parse dimensions, reject as invalid payload
+        if width is None or height is None:
+            defer.returnValue(
+                ImageFetchResult(
+                    success=False,
+                    url=url,
+                    error_message=format_rejection_reason(REJECTION_REASON_INVALID_IMAGE_PAYLOAD, "cannot parse dimensions"),
                 )
-                return
+            )
+            return
+
+        # Validate dimensions
+        if width < self.min_dimensions[0] or height < self.min_dimensions[1]:
+            defer.returnValue(
+                ImageFetchResult(
+                    success=False,
+                    url=url,
+                    error_message=format_rejection_reason(REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL, f"{width}x{height}"),
+                )
+            )
+            return
 
         logger.debug(f"Successfully fetched image: {url} ({file_size} bytes)")
 
@@ -254,18 +263,6 @@ class ScrapyImageDownloader:
     the best integration with Scrapy's ecosystem.
     """
 
-    # Allowed content types
-    ALLOWED_CONTENT_TYPES = {
-        "image/jpeg",
-        "image/jpg",
-        "image/png",
-        "image/gif",
-        "image/webp",
-        "image/svg+xml",
-        "image/bmp",
-        "image/tiff",
-    }
-
     def __init__(
         self,
         min_file_size: int = 1024,
@@ -301,18 +298,18 @@ class ScrapyImageDownloader:
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message=f"HTTP error: {response.status}",
+                error_message=format_rejection_reason(REJECTION_REASON_HTTP_ERROR, f"status_{response.status}"),
             )
 
-        # Validate content type
+        # Validate content type (strict: reject if missing or unsupported)
         content_type = response.headers.get("Content-Type", b"").decode("utf-8", errors="ignore")
-        content_type = content_type.split(";")[0].strip().lower()
 
-        if content_type and content_type not in self.ALLOWED_CONTENT_TYPES:
+        is_valid, error_reason = validate_content_type(content_type)
+        if not is_valid:
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message=f"Invalid content type: {content_type}",
+                error_message=error_reason,
             )
 
         # Get content
@@ -324,30 +321,37 @@ class ScrapyImageDownloader:
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message=f"File too small: {file_size} bytes",
+                error_message=format_rejection_reason(REJECTION_REASON_FILE_TOO_SMALL, f"{file_size} bytes"),
             )
 
         if file_size > self.max_file_size:
             return ImageFetchResult(
                 success=False,
                 url=url,
-                error_message=f"File too large: {file_size} bytes",
+                error_message=format_rejection_reason(REJECTION_REASON_FILE_TOO_LARGE, f"{file_size} bytes"),
             )
 
         # Generate SHA-256 hash
         sha256_hash = hashlib.sha256(content).hexdigest()
 
-        # Parse image dimensions
+        # Parse image dimensions and validate payload
         width, height, img_format = self._parse_image_dimensions(content)
 
+        # If we cannot parse dimensions, reject as invalid payload
+        if width is None or height is None:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=format_rejection_reason(REJECTION_REASON_INVALID_IMAGE_PAYLOAD, "cannot parse dimensions"),
+            )
+
         # Validate dimensions
-        if width and height:
-            if width < self.min_dimensions[0] or height < self.min_dimensions[1]:
-                return ImageFetchResult(
-                    success=False,
-                    url=url,
-                    error_message=f"Image too small: {width}x{height}",
-                )
+        if width < self.min_dimensions[0] or height < self.min_dimensions[1]:
+            return ImageFetchResult(
+                success=False,
+                url=url,
+                error_message=format_rejection_reason(REJECTION_REASON_IMAGE_DIMENSIONS_TOO_SMALL, f"{width}x{height}"),
+            )
 
         # Compute perceptual hashes
         phash_hash = self.fingerprinter.compute_phash(content)

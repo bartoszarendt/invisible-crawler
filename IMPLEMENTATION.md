@@ -4,7 +4,7 @@
 
 **Date:** 2026-02-05  
 **Phase:** 2 (Redis-based scheduling, seed ingestion CLI, crawl run tracking)  
-**Verification:** Code updated, requires testing with Redis instance
+**Verification:** Code updated. Local validation on 2026-02-05 shows partial pass; see "Testing Strategy" for current failing tests.
 
 ---
 
@@ -51,9 +51,10 @@ Phase 2 adds distributed crawling capabilities using Redis-based scheduling and 
    - Connection pooling via `ThreadedConnectionPool`
 
 4. **Tests** ([tests/](tests/))
-   - 32 total tests (unit + integration)
+   - 52 total tests (unit + integration)
    - Mock HTTP server via `pytest-httpserver`
    - Integration tests require running PostgreSQL
+   - Current status (2026-02-05): 46 passing, 6 failing
 
 ### Phase 2 Additions
 
@@ -86,12 +87,15 @@ Phase 2 adds distributed crawling capabilities using Redis-based scheduling and 
 ```
 invisible-crawler/
 ├── crawler/
+│   ├── cli.py
 │   ├── logging_config.py
 │   ├── pipelines.py
+│   ├── scheduler.py
 │   ├── settings.py
 │   └── spiders/
 │       └── discovery_spider.py
 ├── processor/
+│   ├── async_fetcher.py
 │   ├── fetcher.py
 │   └── fingerprint.py
 ├── storage/
@@ -100,13 +104,21 @@ invisible-crawler/
 │   └── migrations/
 │       ├── env.py
 │       └── versions/
-│           └── fcf2fb2ae158_initial_schema.py
+│           ├── fcf2fb2ae158_initial_schema.py
+│           ├── 2a8b1f0e0c7b_add_provenance_unique.py
+│           ├── 3b9c2d1f4e8a_add_images_url_index.py
+│           ├── 44c69f17df6c_add_perceptual_hashes.py
+│           └── 3b65381b0f4e_add_crawl_runs.py
 ├── config/
+│   ├── seed_allowlist.txt
+│   ├── seed_blocklist.txt
 │   └── test_seeds.txt
 ├── tests/
 │   ├── fixtures.py
+│   ├── test_async_fetcher.py
 │   ├── test_integration.py
 │   ├── test_processor.py
+│   ├── test_scheduler.py
 │   └── test_spider.py
 ├── alembic.ini
 ├── pyproject.toml
@@ -292,45 +304,44 @@ mypy crawler/ processor/ storage/
 
 **Remaining Gaps:**
 
-1. **Perceptual hashes not computed**
-   - Schema includes `phash_hash` and `dhash_hash` columns
-   - `processor/fingerprint.py` has placeholder methods
-   - Pipeline doesn't call fingerprinting functions
-   - **Impact**: Similarity search not yet possible
-   - **Tracked for**: Future enhancement
-
-2. **No Redis connection fallback**
+1. **No Redis connection fallback**
    - Scheduler requires Redis when enabled
    - No graceful degradation to memory scheduler
    - **Impact**: Spider fails if Redis unavailable
    - **Workaround**: Check Redis availability before starting crawl
    - **Decision**: Accept hard dependency or implement fallback
 
-3. **Crawl run images_downloaded not populated**
+2. **Crawl run images_downloaded not populated**
    - Pipeline doesn't update `crawl_runs.images_downloaded`
    - **Impact**: Incomplete run statistics
    - **Tracked for**: Future enhancement
 
-4. **No tests for Phase 2 components**
-   - Redis scheduler integration not covered by tests
-   - CLI commands not tested
-   - Crawl run tracking not tested
-   - **Impact**: Regression risk, requires manual validation
+3. **Phase 2 tests exist but are not green end-to-end**
+   - `test_scheduler.py` exists but currently has 5 failures due mock incompatibility with `scrapy-redis` internals
+   - `test_integration.py` currently has 1 failing end-to-end test (`test_full_pipeline_single_page`)
+   - CLI commands and crawl run tracking still lack direct integration test coverage
+   - **Impact**: Regression risk; Phase 2 behavior still needs manual validation
    - **Priority**: High
 
-5. **AsyncImageFetcher is unused**
+4. **AsyncImageFetcher is unused**
    - `processor/async_fetcher.py::AsyncImageFetcher` is implemented but not wired
    - `ScrapyImageDownloader` is used instead
    - **Decision**: Remove or document as alternative implementation
 
-6. **Object storage not implemented**
+5. **Object storage not implemented**
    - Settings include MinIO/S3 placeholders
    - No binary asset storage (only metadata)
    - **Tracked for**: Phase 3
 
-7. **Structured logging not activated**
+6. **Structured logging not activated**
    - `crawler/logging_config.py` exists but not wired to spider/pipeline
    - **Tracked for**: Future enhancement
+
+7. **SVG currently indexed despite downstream incompatibility goals**
+   - Current allowlists still accept `image/svg+xml` in spider/fetcher paths
+   - This inflates `format='unknown'` counts because Pillow does not parse SVG dimensions/format
+   - **Impact**: Skewed quality metrics and incompatible assets for future InvisibleID workflows
+   - **Priority**: High
 
 ---
 
@@ -340,7 +351,7 @@ mypy crawler/ processor/ storage/
 
 | Improvement | Rationale | Status |
 |-------------|-----------|--------|
-| **Perceptual hash computation** | pHash/dHash enable similarity search for detecting re-encoded/cropped images. Compute during validation (cheap). | Schema ready, needs wiring |
+| **Similarity search index** | Perceptual hashes (pHash/dHash) are computed (85.9% coverage). Build search index to enable detection of re-encoded/cropped images using existing hash data. | Hashes ready in DB |
 | **Object storage for binaries** | Currently only metadata is stored. Add MinIO/S3 backend for content-addressable binary storage `/{sha256[0:2]}/{sha256[2:4]}/{sha256}`. | Settings placeholders exist |
 | **Additional Phase 2 tests** | CLI integration tests, crawl run tracking tests, dual-mode seed tests. Some unit tests exist (test_scheduler.py), need integration coverage. | High priority |
 | **Distributed crawl mode** | Support `scrapyd` or multiple Scrapy instances sharing Redis queue for horizontal scaling. | Planning |
@@ -455,6 +466,9 @@ Pipeline ensures provenance record
 - **Redis scheduler**: 8 tests in test_scheduler.py (mock Redis client, priority handling, queue operations)
 - **Async fetcher**: 12 tests in test_async_fetcher.py
 - **Integration**: 7 tests in test_integration.py (requires PostgreSQL)
+- **Current run status (2026-02-05)**: 46 passed, 6 failed
+  - Scheduler: 5 failures (`test_scheduler.py`)
+  - End-to-end: 1 failure (`test_integration.py::test_full_pipeline_single_page`)
 
 ### Additional Tests Needed (Phase 2 Gaps)
 - **CLI commands**: Test seed ingestion, queue status, list-runs end-to-end

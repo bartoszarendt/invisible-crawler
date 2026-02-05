@@ -1,11 +1,10 @@
 """Tests for async image fetching module."""
 
 import io
-from unittest.mock import MagicMock, Mock
 
 import pytest
 from PIL import Image
-from scrapy.http import Response, Request
+from scrapy.http import Request, Response
 
 from processor.async_fetcher import (
     ScrapyImageDownloader,
@@ -80,7 +79,7 @@ class TestScrapyImageDownloader:
 
         assert result.success is False
         assert result.error_message is not None
-        assert "HTTP error: 404" in result.error_message
+        assert result.error_message == "http_error: status_404"
 
     def test_process_response_invalid_content_type(
         self, downloader: ScrapyImageDownloader, sample_image_bytes: bytes
@@ -99,7 +98,7 @@ class TestScrapyImageDownloader:
 
         assert result.success is False
         assert result.error_message is not None
-        assert "Invalid content type" in result.error_message
+        assert "unsupported_content_type" in result.error_message
 
     def test_process_response_file_too_large(self, downloader: ScrapyImageDownloader) -> None:
         """Test rejection of files above maximum size."""
@@ -120,7 +119,7 @@ class TestScrapyImageDownloader:
 
         assert result.success is False
         assert result.error_message is not None
-        assert "File too large" in result.error_message
+        assert "file_too_large" in result.error_message
 
     def test_process_response_dimensions_too_small(self, downloader: ScrapyImageDownloader) -> None:
         """Test rejection of images below minimum dimensions."""
@@ -143,7 +142,7 @@ class TestScrapyImageDownloader:
 
         assert result.success is False
         assert result.error_message is not None
-        assert "Image too small" in result.error_message
+        assert "image_dimensions_too_small" in result.error_message
 
     def test_process_response_consistent_hashing(
         self, downloader: ScrapyImageDownloader, sample_image_bytes: bytes
