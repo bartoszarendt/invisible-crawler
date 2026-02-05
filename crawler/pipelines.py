@@ -218,9 +218,10 @@ class ImageProcessingPipeline:
                         """
                         INSERT INTO images (
                             url, sha256_hash, width, height, format,
-                            content_type, file_size_bytes, download_success
+                            content_type, file_size_bytes, download_success,
+                            phash_hash, dhash_hash
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
                         """,
                         (
@@ -232,14 +233,23 @@ class ImageProcessingPipeline:
                             fetch_result.content_type,
                             fetch_result.file_size,
                             True,
+                            fetch_result.phash_hash,
+                            fetch_result.dhash_hash,
                         ),
                     )
                     image_id = cursor.fetchone()[0]
                     logger.debug(f"Inserted new image: {url} -> {image_id}")
                     status = "downloaded"
 
-                # Add provenance record
-                self._ensure_provenance(image_id, source_page, source_domain)
+                # Add provenance record within same transaction
+                cursor.execute(
+                    """
+                    INSERT INTO provenance (image_id, source_page_url, source_domain)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (image_id, source_page_url) DO NOTHING
+                    """,
+                    (image_id, source_page, source_domain),
+                )
 
                 return {
                     "status": status,

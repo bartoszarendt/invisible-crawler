@@ -33,6 +33,8 @@ class ImageFetchResult:
         height: Image height in pixels (if parseable).
         format: Image format (e.g., 'JPEG', 'PNG').
         sha256_hash: SHA-256 hash of the content.
+        phash_hash: Perceptual hash (pHash) for similarity matching.
+        dhash_hash: Difference hash (dHash) for similarity matching.
         error_message: Description of failure (if unsuccessful).
     """
 
@@ -45,6 +47,8 @@ class ImageFetchResult:
     height: int | None = None
     format: str | None = None
     sha256_hash: str | None = None
+    phash_hash: str | None = None
+    dhash_hash: str | None = None
     error_message: str | None = None
 
 

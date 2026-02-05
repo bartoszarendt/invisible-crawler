@@ -16,6 +16,7 @@ from twisted.web.client import Agent, readBody
 from twisted.web.http_headers import Headers
 
 from processor.fetcher import ImageFetchResult
+from processor.fingerprint import ImageFingerprinter
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +284,7 @@ class ScrapyImageDownloader:
         self.min_file_size = min_file_size
         self.max_file_size = max_file_size
         self.min_dimensions = (min_width, min_height)
+        self.fingerprinter = ImageFingerprinter()
 
     def process_response(self, url: str, response: Response) -> ImageFetchResult:
         """Process a Scrapy Response object into an ImageFetchResult.
@@ -347,6 +349,10 @@ class ScrapyImageDownloader:
                     error_message=f"Image too small: {width}x{height}",
                 )
 
+        # Compute perceptual hashes
+        phash_hash = self.fingerprinter.compute_phash(content)
+        dhash_hash = self.fingerprinter.compute_dhash(content)
+
         return ImageFetchResult(
             success=True,
             url=url,
@@ -357,6 +363,8 @@ class ScrapyImageDownloader:
             height=height,
             format=img_format,
             sha256_hash=sha256_hash,
+            phash_hash=phash_hash,
+            dhash_hash=dhash_hash,
         )
 
     def _parse_image_dimensions(self, content: bytes) -> tuple[int | None, int | None, str | None]:
