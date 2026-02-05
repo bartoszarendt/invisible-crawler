@@ -311,6 +311,7 @@ class TestEndToEnd:
             url=httpserver.url_for("/"),
             request=request,
             body=html_content.encode("utf-8"),
+            headers={"Content-Type": "text/html; charset=utf-8"},
         )
 
         # Parse and collect image items

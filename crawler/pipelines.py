@@ -4,6 +4,8 @@ Pipelines process scraped items (images) and persist them to storage.
 """
 
 import logging
+import os
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from scrapy.exceptions import DropItem
@@ -38,6 +40,7 @@ class ImageProcessingPipeline:
             "total_bytes_downloaded": 0,
         }
         self.fetcher: ImageFetcher | None = None
+        self.discovery_refresh_after_days = _get_int_env("DISCOVERY_REFRESH_AFTER_DAYS", 0)
 
     @classmethod
     def from_crawler(cls, crawler: Any) -> "ImageProcessingPipeline":
@@ -76,6 +79,11 @@ class ImageProcessingPipeline:
         """
         if self.fetcher:
             self.fetcher.close()
+
+        # Close database connection pool to release resources
+        from storage.db import close_all_connections
+
+        close_all_connections()
 
         logger.info("=" * 50)
         logger.info("ImageProcessingPipeline Statistics:")
@@ -123,6 +131,10 @@ class ImageProcessingPipeline:
         except Exception as e:
             self.stats["images_failed"] += 1
             logger.error(f"Failed to process image {item.get('url')}: {e}")
+            # Don't raise DropItem on interruption-related errors
+            if "shutdown" in str(e).lower() or "interrupt" in str(e).lower():
+                logger.info(f"Gracefully handling interruption for {item.get('url')}")
+                return item
             raise DropItem(f"Failed to process image: {e}")
 
         return item
@@ -139,9 +151,22 @@ class ImageProcessingPipeline:
         url = item.get("url", "")
         source_page = item.get("source_page", "")
         source_domain = item.get("source_domain", "")
+        crawl_type = item.get("crawl_type", "discovery")
 
         if not self.fetcher:
             raise RuntimeError("ImageFetcher not initialized")
+
+        if crawl_type == "discovery":
+            existing = self._get_existing_image_by_url(url)
+            if existing:
+                image_id, last_seen_at = existing
+                if not self._should_refresh(last_seen_at):
+                    self._ensure_provenance(image_id, source_page, source_domain)
+                    return {
+                        "status": "skipped",
+                        "image_id": str(image_id),
+                        "reason": "already_seen",
+                    }
 
         # Fetch the image
         fetch_result = self.fetcher.fetch(url)
@@ -194,7 +219,7 @@ class ImageProcessingPipeline:
                         (image_id,),
                     )
 
-                    logger.debug(f"Image already exists (hash match): {url}")
+                    logger.debug(f"Image already exists (hash match): {url} -> {image_id}")
                     status = "deduplicated"
                 else:
                     # Insert new image record
@@ -219,18 +244,11 @@ class ImageProcessingPipeline:
                         ),
                     )
                     image_id = cursor.fetchone()[0]
-                    logger.debug(f"Inserted new image: {url}")
+                    logger.debug(f"Inserted new image: {url} -> {image_id}")
                     status = "downloaded"
 
                 # Add provenance record
-                cursor.execute(
-                    """
-                    INSERT INTO provenance (image_id, source_page_url, source_domain)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (image_id, source_page, source_domain),
-                )
+                self._ensure_provenance(image_id, source_page, source_domain)
 
                 return {
                     "status": status,
@@ -241,3 +259,60 @@ class ImageProcessingPipeline:
         except Exception as e:
             logger.error(f"Database error storing image {url}: {e}")
             raise
+
+    def _get_existing_image_by_url(self, url: str) -> tuple[Any, Any] | None:
+        """Return existing image id and last_seen_at for a URL if present."""
+        try:
+            with get_cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, last_seen_at FROM images WHERE url = %s",
+                    (url,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return row[0], row[1]
+        except Exception as e:
+            logger.warning(f"Failed to check existing image for {url}: {e}")
+        return None
+
+    def _ensure_provenance(self, image_id: Any, source_page: str, source_domain: str) -> None:
+        """Insert provenance row if it does not already exist."""
+        try:
+            with get_cursor() as cursor:
+                # First verify the image still exists (defensive check)
+                cursor.execute("SELECT 1 FROM images WHERE id = %s", (image_id,))
+                exists = cursor.fetchone()
+                if not exists:
+                    logger.warning(f"Image {image_id} not found in database, skipping provenance insertion")
+                    return
+
+                cursor.execute(
+                    """
+                    INSERT INTO provenance (image_id, source_page_url, source_domain)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (image_id, source_page_url) DO NOTHING
+                    """,
+                    (image_id, source_page, source_domain),
+                )
+                logger.debug(f"Successfully inserted provenance for image {image_id}")
+        except Exception as e:
+            logger.warning(f"Failed to insert provenance for {image_id}: {e}")
+            # Don't re-raise the exception to avoid crashing the pipeline
+
+    def _should_refresh(self, last_seen_at: datetime | None) -> bool:
+        """Determine if an image should be refreshed based on last_seen_at."""
+        if self.discovery_refresh_after_days <= 0 or last_seen_at is None:
+            return False
+        threshold = datetime.now(UTC) - timedelta(days=self.discovery_refresh_after_days)
+        return last_seen_at < threshold
+
+
+def _get_int_env(name: str, default: int) -> int:
+    """Parse an int environment variable with a safe fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default

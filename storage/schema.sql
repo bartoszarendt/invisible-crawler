@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS provenance (
     source_page_url TEXT NOT NULL,
     source_domain VARCHAR(255) NOT NULL,
     discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    discovery_type VARCHAR(20) DEFAULT 'discovery'  -- 'discovery' or 'refresh'
+    discovery_type VARCHAR(20) DEFAULT 'discovery',  -- 'discovery' or 'refresh'
+    CONSTRAINT uq_provenance_image_page UNIQUE (image_id, source_page_url)
 );
 
 -- Create indexes for provenance

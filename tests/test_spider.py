@@ -90,6 +90,7 @@ class TestDiscoverySpider:
             url="https://example.com/",
             request=request,
             body=SAMPLE_HTML.encode("utf-8"),
+            headers={"Content-Type": "text/html; charset=utf-8"},
         )
 
         items = list(spider.parse(response))
@@ -113,6 +114,7 @@ class TestDiscoverySpider:
             url="https://example.com/",
             request=request,
             body=SAMPLE_HTML.encode("utf-8"),
+            headers={"Content-Type": "text/html; charset=utf-8"},
         )
 
         items = list(spider.parse(response))

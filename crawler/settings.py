@@ -22,7 +22,7 @@ DOWNLOAD_DELAY = 1  # 1 second between requests (conservative)
 
 # The download delay setting will honor only one of:
 CONCURRENT_REQUESTS_PER_DOMAIN = 1
-CONCURRENT_REQUESTS_PER_IP = 1
+# CONCURRENT_REQUESTS_PER_IP = 1  # Deprecated, removed to avoid conflicts
 
 # Disable cookies (enabled by default)
 COOKIES_ENABLED = False

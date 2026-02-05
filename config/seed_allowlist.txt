@@ -1,0 +1,3 @@
+# Optional allowlist for seed domains
+# If this file has entries, only listed domains will be crawled.
+# One domain per line (optionally with scheme).

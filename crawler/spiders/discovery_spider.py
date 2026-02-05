@@ -9,7 +9,9 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from scrapy import Spider
-from scrapy.http import Request, Response
+from scrapy.http import Request, Response, TextResponse
+
+from storage.db import get_cursor
 
 
 class DiscoverySpider(Spider):
@@ -43,9 +45,17 @@ class DiscoverySpider(Spider):
         super().__init__(**kwargs)
         self.seeds_file = seeds
         self.max_pages = int(kwargs.get("max_pages", 10))
+        self.allowlist_file = kwargs.get("allowlist", "config/seed_allowlist.txt")
+        self.blocklist_file = kwargs.get("blocklist", "config/seed_blocklist.txt")
+        self.max_domain_errors = _get_int(kwargs.get("max_domain_errors"), 3)
+        self.block_on_login = _get_bool(kwargs.get("block_on_login"), True)
         self.images_found: int = 0
         self.pages_crawled: int = 0
         self._domains: list[str] = []
+        self._allowlist = self._load_domain_list(self.allowlist_file)
+        self._blocklist = self._load_domain_list(self.blocklist_file)
+        self._blocked_domains_runtime: set[str] = set()
+        self._domain_error_counts: dict[str, int] = {}
 
     def start_requests(self) -> Any:
         """Generate initial requests from seed domains.
@@ -74,6 +84,14 @@ class DiscoverySpider(Spider):
                 domain = line
                 if not domain.startswith(("http://", "https://")):
                     domain = f"https://{domain}"
+
+                domain_netloc = urlparse(domain).netloc
+                if self._allowlist and domain_netloc not in self._allowlist:
+                    self.logger.info(f"Skipping seed (not in allowlist): {domain}")
+                    continue
+                if domain_netloc in self._blocklist:
+                    self.logger.info(f"Skipping seed (blocked): {domain}")
+                    continue
 
                 self._domains.append(domain)
                 self.logger.info(f"Adding seed domain: {domain}")
@@ -104,11 +122,46 @@ class DiscoverySpider(Spider):
             f"(depth: {current_depth})"
         )
 
+        if current_domain in self._blocked_domains_runtime:
+            self.logger.info(f"Skipping blocked domain: {current_domain}")
+            return
+
+        # Check if response is HTML/text before parsing
+        content_type = (
+            response.headers.get("Content-Type", b"")
+            .decode("utf-8", errors="ignore")
+            .lower()
+        )
+        is_text_response = isinstance(response, TextResponse)
+
+        # Be more permissive: try to parse if content-type suggests HTML or if it's a text response
+        should_parse = (
+            is_text_response or
+            (content_type and ("html" in content_type or "text" in content_type)) or
+            (not content_type and len(response.body) > 0)  # Fallback for responses without content-type
+        )
+
+        if not should_parse:
+            self.logger.debug(f"Skipping non-HTML response: {content_type} for {response.url}")
+            return
+
+        if self.block_on_login and self._looks_like_login_page(response):
+            self._mark_domain_blocked(current_domain, "login_required")
+            return
+
         # Extract image URLs from the page
         image_urls = self._extract_image_urls(response, current_domain)
         self.images_found += len(image_urls)
 
         self.logger.info(f"Found {len(image_urls)} images on {response.url}")
+
+        # Best-effort crawl log entry (only when running under Scrapy)
+        self._log_crawl_entry(
+            page_url=response.url,
+            domain=current_domain,
+            status=response.status,
+            images_found=len(image_urls),
+        )
 
         # Yield image data for processing
         for img_url in image_urls:
@@ -117,6 +170,7 @@ class DiscoverySpider(Spider):
                 "url": img_url,
                 "source_page": response.url,
                 "source_domain": current_domain,
+                "crawl_type": "discovery",
             }
 
         # Follow same-domain links if we haven't reached max pages
@@ -150,37 +204,43 @@ class DiscoverySpider(Spider):
         """
         image_urls: set[str] = set()
 
-        # Extract from <img> tags
-        for img in response.css("img"):
-            src = img.css("::attr(src)").get()
-            if src:
-                absolute_url = urljoin(response.url, src)
+        try:
+            # Extract from <img> tags
+            for img in response.css("img"):
+                src = img.css("::attr(src)").get()
+                if src:
+                    absolute_url = urljoin(response.url, src)
+                    if self._is_valid_image_url(absolute_url):
+                        image_urls.add(absolute_url)
+
+                # Extract from srcset
+                srcset = img.css("::attr(srcset)").get()
+                if srcset:
+                    for url in self._parse_srcset(srcset):
+                        absolute_url = urljoin(response.url, url)
+                        if self._is_valid_image_url(absolute_url):
+                            image_urls.add(absolute_url)
+
+            # Extract from <picture> sources
+            for source in response.css("picture source"):
+                srcset = source.css("::attr(srcset)").get()
+                if srcset:
+                    for url in self._parse_srcset(srcset):
+                        absolute_url = urljoin(response.url, url)
+                        if self._is_valid_image_url(absolute_url):
+                            image_urls.add(absolute_url)
+
+            # Extract from Open Graph meta tags
+            og_image = response.css('meta[property="og:image"]::attr(content)').get()
+            if og_image:
+                absolute_url = urljoin(response.url, og_image)
                 if self._is_valid_image_url(absolute_url):
                     image_urls.add(absolute_url)
 
-            # Extract from srcset
-            srcset = img.css("::attr(srcset)").get()
-            if srcset:
-                for url in self._parse_srcset(srcset):
-                    absolute_url = urljoin(response.url, url)
-                    if self._is_valid_image_url(absolute_url):
-                        image_urls.add(absolute_url)
-
-        # Extract from <picture> sources
-        for source in response.css("picture source"):
-            srcset = source.css("::attr(srcset)").get()
-            if srcset:
-                for url in self._parse_srcset(srcset):
-                    absolute_url = urljoin(response.url, url)
-                    if self._is_valid_image_url(absolute_url):
-                        image_urls.add(absolute_url)
-
-        # Extract from Open Graph meta tags
-        og_image = response.css('meta[property="og:image"]::attr(content)').get()
-        if og_image:
-            absolute_url = urljoin(response.url, og_image)
-            if self._is_valid_image_url(absolute_url):
-                image_urls.add(absolute_url)
+        except Exception as e:
+            self.logger.warning(f"Failed to parse HTML from {response.url}: {e}")
+            # Return empty list if parsing fails
+            return []
 
         return list(image_urls)
 
@@ -196,19 +256,23 @@ class DiscoverySpider(Spider):
         """
         links: list[str] = []
 
-        for href in response.css("a::attr(href)").getall():
-            absolute_url = urljoin(response.url, href)
-            parsed = urlparse(absolute_url)
+        try:
+            for href in response.css("a::attr(href)").getall():
+                absolute_url = urljoin(response.url, href)
+                parsed = urlparse(absolute_url)
 
-            # Only follow same-domain links
-            if parsed.netloc == domain:
-                # Skip non-HTML resources
-                if any(
-                    parsed.path.lower().endswith(ext)
-                    for ext in [".pdf", ".zip", ".exe", ".dmg", ".jpg", ".png", ".gif"]
-                ):
-                    continue
-                links.append(absolute_url)
+                # Only follow same-domain links
+                if parsed.netloc == domain:
+                    # Skip non-HTML resources
+                    if any(
+                        parsed.path.lower().endswith(ext)
+                        for ext in [".pdf", ".zip", ".exe", ".dmg", ".jpg", ".png", ".gif"]
+                    ):
+                        continue
+                    links.append(absolute_url)
+        except Exception as e:
+            self.logger.warning(f"Failed to extract links from {response.url}: {e}")
+            return []
 
         return links
 
@@ -254,7 +318,53 @@ class DiscoverySpider(Spider):
         if "image" in path_lower or "/img/" in path_lower:
             return True
 
-        return True  # Be permissive in Phase 1
+        # Reject URLs that don't look like images
+        return False
+
+    def _load_domain_list(self, path: str | None) -> set[str]:
+        """Load a domain allowlist or blocklist from a file.
+
+        Args:
+            path: Path to the list file.
+
+        Returns:
+            Set of domain netlocs.
+        """
+        if not path:
+            return set()
+
+        list_path = Path(path)
+        if not list_path.exists():
+            return set()
+
+        domains: set[str] = set()
+        with open(list_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                value = line
+                if not value.startswith(("http://", "https://")):
+                    value = f"https://{value}"
+                domains.add(urlparse(value).netloc)
+        return domains
+
+    def _mark_domain_blocked(self, domain: str, reason: str) -> None:
+        """Block a domain for the remainder of this crawl."""
+        if domain not in self._blocked_domains_runtime:
+            self._blocked_domains_runtime.add(domain)
+            self.logger.warning(f"Blocking domain {domain}: {reason}")
+
+    def _looks_like_login_page(self, response: Response) -> bool:
+        """Heuristic check for login pages."""
+        if not isinstance(response, TextResponse):
+            return False
+        try:
+            has_password = bool(response.css('input[type="password"]').get())
+            title = (response.css("title::text").get() or "").lower()
+            return has_password or "login" in title or "sign in" in title
+        except Exception:
+            return False
 
     def handle_error(self, failure: Any) -> None:
         """Handle request errors.
@@ -265,6 +375,32 @@ class DiscoverySpider(Spider):
         self.logger.error(f"Request failed: {failure.getErrorMessage()}")
         self.logger.error(
             f"Failed URL: {failure.request.url if hasattr(failure, 'request') else 'unknown'}"
+        )
+
+        status = None
+        try:
+            if hasattr(failure, "value") and hasattr(failure.value, "response"):
+                status = failure.value.response.status
+        except Exception:
+            status = None
+
+        domain = (
+            urlparse(failure.request.url).netloc
+            if hasattr(failure, "request")
+            else "unknown"
+        )
+        if status in {403, 429, 503} and domain != "unknown":
+            self._domain_error_counts[domain] = self._domain_error_counts.get(domain, 0) + 1
+            if self._domain_error_counts[domain] >= self.max_domain_errors:
+                self._mark_domain_blocked(domain, f"too_many_errors_{status}")
+
+        # Best-effort crawl log for failures
+        self._log_crawl_entry(
+            page_url=failure.request.url if hasattr(failure, "request") else "unknown",
+            domain=domain,
+            status=status,
+            images_found=0,
+            error_message=failure.getErrorMessage(),
         )
 
     def closed(self, reason: str) -> None:
@@ -278,3 +414,61 @@ class DiscoverySpider(Spider):
         self.logger.info(f"Pages crawled: {self.pages_crawled}")
         self.logger.info(f"Images found: {self.images_found}")
         self.logger.info("=" * 50)
+
+    def _log_crawl_entry(
+        self,
+        page_url: str,
+        domain: str,
+        status: int | None,
+        images_found: int,
+        error_message: str | None = None,
+    ) -> None:
+        """Write a minimal crawl_log entry (best-effort).
+
+        This is intentionally lightweight and does not interrupt crawling on failure.
+        """
+        if not getattr(self, "crawler", None):
+            return
+
+        try:
+            with get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO crawl_log (page_url, domain, status, images_found, error_message, crawl_type)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        page_url,
+                        domain,
+                        status,
+                        images_found,
+                        error_message,
+                        "discovery",
+                    ),
+                )
+        except Exception as exc:
+            self.logger.warning(f"Failed to write crawl_log entry: {exc}")
+
+
+def _get_int(raw: Any, default: int) -> int:
+    """Parse int values from spider args."""
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_bool(raw: Any, default: bool) -> bool:
+    """Parse bool values from spider args."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default

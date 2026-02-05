@@ -4,41 +4,32 @@ InvisibleCrawler is a self-hosted, large-scale web crawler designed to discover 
 
 ## Repository Structure
 
-> TODO: Project is in early design phase; no implementation directories exist yet.
-
-* **SYSTEM_DESIGN.md** – comprehensive architectural blueprint covering goals, design principles, data flow, storage choices, and evolution path.
-
-Once implemented, expected structure:
+* **SYSTEM_DESIGN.md** – architectural blueprint covering goals, design principles, data flow, and evolution path
+* **IMPLEMENTATION.md** – Phase 1 implementation details, runbook, and Phase 2 roadmap
 * **crawler/** – Scrapy-based crawling engine with spiders and pipelines
-* **scheduler/** – URL frontier implementation for queue management and rate limiting
 * **processor/** – image fetching, normalization, and fingerprinting logic
-* **storage/** – database schemas and migration scripts for PostgreSQL
-* **config/** – seed domain lists, crawl policies, and environment configs
-* **tests/** – unit, integration, and end-to-end test suites
-* **docs/** – operational runbooks and architecture decision records
+* **storage/** – database schemas and Alembic migrations for PostgreSQL
+* **config/** – seed domain lists, allowlists, and blocklists
+* **tests/** – unit and integration test suites (32 tests)
 
 ## Build & Development Commands
 
-> TODO: No build system configured yet. Expected tooling:
-
 ```bash
-# Install dependencies (Python-based, Scrapy core)
+# Install dependencies
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 # Run database migrations
 alembic upgrade head
 
 # Start crawler (discovery mode)
-scrapy crawl discovery -a seeds=config/tranco_top10k.txt
-
-# Start crawler (refresh mode)
-scrapy crawl refresh -a input=data/known_urls.csv
+scrapy crawl discovery -a seeds=config/test_seeds.txt -a max_pages=100
 
 # Run tests
-pytest tests/ --cov=crawler
+pytest tests/ --cov=crawler --cov=processor --cov-report=term-missing
 
 # Type checking
-mypy crawler/ scheduler/ processor/
+mypy crawler/ processor/ storage/
 
 # Lint
 ruff check .
@@ -48,8 +39,6 @@ black .
 ```
 
 ## Code Style & Conventions
-
-> TODO: Style guide to be formalized. Anticipated conventions:
 
 * **Formatting**: Black (line length 100), isort for imports
 * **Linting**: Ruff with strict settings; mypy in `--strict` mode
@@ -103,14 +92,11 @@ The crawler follows a pipeline architecture with clear stage boundaries:
 
 ## Testing Strategy
 
-> TODO: Test infrastructure not yet implemented. Planned approach:
-
-* **Unit tests**: pytest for individual components (parsers, fingerprinters, normalizers)
-* **Integration tests**: testcontainers for PostgreSQL and Redis fixtures
-* **End-to-end tests**: isolated crawl simulations against mock HTTP servers
-* **CI pipeline**: GitHub Actions running lint, type-check, and full test suite on every PR
-* **Coverage target**: ≥80% for core logic; exceptions allowed for scaffolding code
-* **Fixtures**: Synthetic HTML pages and test images versioned in `tests/fixtures/`
+* **Unit tests**: pytest for individual components (fetcher, fingerprinter, spider parsing)
+* **Integration tests**: pytest-httpserver for mock HTTP endpoints; requires running PostgreSQL
+* **Test count**: 32 tests covering processor, spider, and pipeline integration
+* **Fixtures**: Synthetic HTML pages in `tests/fixtures.py`
+* **Coverage target**: ≥80% for core logic
 
 ## Security & Compliance
 
@@ -121,8 +107,6 @@ The crawler follows a pipeline architecture with clear stage boundaries:
 * **Data retention**: Provenance metadata stored indefinitely; binary retention policy TBD
 * **Licensing**: Project license TBD; third-party dependencies reviewed for compatibility
 * **Privacy**: Crawler identifies itself via User-Agent; contact information included
-
-> TODO: Formalize GDPR/CCPA compliance strategy for discovered personal images
 
 ## Agent Guardrails
 
@@ -147,36 +131,25 @@ The crawler follows a pipeline architecture with clear stage boundaries:
 
 ## Extensibility Hooks
 
-> TODO: Plugin system design pending. Anticipated extension points:
-
 * **Custom spider middleware**: Inject domain-specific parsing logic
 * **Fingerprinting algorithms**: Pluggable hash function registry
 * **Storage backends**: Abstract interface for swapping PostgreSQL/object storage
 * **Seed providers**: Dynamic seed generation from external APIs
 * **Post-processing pipelines**: Hook for adding custom analyzers without forking
 
-**Environment Variables:**
+**Environment Variables (Phase 1):**
 
-* `CRAWLER_MODE`: `discovery` | `refresh`
-* `RATE_LIMIT_DEFAULT`: requests per second per domain
-* `IMAGE_MIN_SIZE`: minimum image dimensions to fetch
-* `STORAGE_BACKEND`: `postgres` | `clickhouse` (future)
-* `OBJECT_STORE_ENDPOINT`: S3-compatible storage URL
-* `FEATURE_FLAG_JS_RENDERING`: enable Playwright for selective JS sites
+* `DATABASE_URL`: PostgreSQL connection string
+* `CRAWLER_USER_AGENT`: User-Agent string for image fetching
+* `DISCOVERY_REFRESH_AFTER_DAYS`: Re-fetch images older than N days (default: 0 = disabled)
 
 ## Further Reading
 
-> TODO: Additional documentation to be created:
-
-* **docs/ARCHITECTURE.md** – detailed component diagrams and interaction protocols
-* **docs/OPERATIONS.md** – deployment guide, monitoring, and incident response
-* **docs/ADR/** – architecture decision records tracking key design choices
-* **docs/SEED_CURATION.md** – methodology for selecting and vetting seed domains
-* **docs/FINGERPRINTING.md** – deep dive on hash selection and collision handling
-* **docs/INVISIBLEID_INTEGRATION.md** – future integration plan with detection service
+* **IMPLEMENTATION.md** – Phase 1 details, local runbook, and Phase 2 roadmap
+* **SYSTEM_DESIGN.md** – architectural blueprint and design principles
 
 ---
 
 **Last Updated**: 2026-02-05  
-**Status**: Design phase; implementation pending  
+**Status**: Phase 1 complete (local, on-demand crawling)  
 **Maintainer Contact**: TBD

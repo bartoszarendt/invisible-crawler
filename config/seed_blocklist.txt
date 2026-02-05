@@ -1,0 +1,3 @@
+# Optional blocklist for seed domains
+# Any listed domains will be skipped during crawling.
+# One domain per line (optionally with scheme).

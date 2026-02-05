@@ -40,9 +40,10 @@ InvisibleCrawler fetches images from the web, generates stable fingerprints (SHA
    pytest tests/ --cov=crawler --cov=processor --cov-report=term-missing
    ```
 
-5. **Run crawler (test mode):**
+5. **Run crawler:**
    ```bash
-   scrapy crawl discovery -a seeds=config/test_seeds.txt -s CLOSESPIDER_PAGECOUNT=10
+   # Run with page limit
+   scrapy crawl discovery -a seeds=config/test_seeds.txt -a max_pages=100
    ```
 
 ## Development
@@ -67,9 +68,11 @@ mypy crawler/ processor/ storage/
 pytest tests/ --cov=crawler --cov=processor --cov-report=term-missing
 ```
 
-## Architecture
+## Documentation
 
-See [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) for detailed architecture documentation.
+* [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) – Architecture and design principles
+* [IMPLEMENTATION.md](IMPLEMENTATION.md) – Phase 1 implementation details and Phase 2 roadmap
+* [AGENTS.md](AGENTS.md) – Agent guidelines and project conventions
 
 ## License
 
