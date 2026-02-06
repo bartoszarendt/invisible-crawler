@@ -9,7 +9,6 @@ Provides management commands for:
 import argparse
 import csv
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -17,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from crawler.scheduler import check_redis_available
+from env_config import get_redis_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,7 +37,7 @@ def ingest_seeds_command(args: argparse.Namespace) -> int:
     source = args.source
     limit = args.limit
     offset = args.offset
-    redis_url = args.redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_url = args.redis_url or get_redis_url()
 
     logger.info(f"Ingesting seeds from {source}")
     logger.info(f"Limit: {limit}, Offset: {offset}")
@@ -240,7 +240,7 @@ def queue_status_command(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 for success, 1 for failure).
     """
-    redis_url = args.redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_url = args.redis_url or get_redis_url()
 
     if not check_redis_available(redis_url):
         logger.error("Redis is not available.")

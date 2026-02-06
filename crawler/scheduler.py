@@ -5,7 +5,6 @@ deduplication, and crawl resume capabilities.
 """
 
 import logging
-import os
 from typing import Any
 from urllib.parse import urlparse
 
@@ -16,10 +15,9 @@ from scrapy.utils.misc import load_object
 from scrapy_redis.queue import PriorityQueue
 from scrapy_redis.scheduler import Scheduler as RedisScheduler
 
-logger = logging.getLogger(__name__)
+from env_config import get_redis_url
 
-# Environment variables
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+logger = logging.getLogger(__name__)
 
 
 class InvisibleRedisScheduler(RedisScheduler):
@@ -351,7 +349,7 @@ def check_redis_available(url: str | None = None) -> bool:
     """
     import redis
 
-    url = url or REDIS_URL
+    url = url or get_redis_url()
     try:
         client = redis.from_url(url, socket_connect_timeout=2)
         client.ping()

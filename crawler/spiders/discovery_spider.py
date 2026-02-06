@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlparse
 from scrapy import Spider, signals
 from scrapy.http import Request, Response, TextResponse
 
+from env_config import get_redis_url
 from processor.media_policy import ALLOWED_EXTENSIONS
 from storage.db import get_cursor
 
@@ -185,8 +186,7 @@ class DiscoverySpider(Spider):
         Returns:
             List of URLs from Redis, or empty list if Redis unavailable.
         """
-        import os
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        redis_url = get_redis_url()
 
         try:
             import redis

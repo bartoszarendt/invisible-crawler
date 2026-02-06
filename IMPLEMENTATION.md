@@ -213,6 +213,8 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt
 
 # Configure database and Redis
+# Copy template and edit local values
+# cp .env.example .env
 # Edit .env with DATABASE_URL and REDIS_URL
 
 # Apply schema migrations
@@ -428,6 +430,13 @@ Pipeline ensures provenance record
 | `DISCOVERY_REFRESH_AFTER_DAYS` | `0` (disabled) | Re-fetch images older than N days |
 | `IMAGE_MIN_WIDTH` | `256` | Minimum image width in pixels |
 | `IMAGE_MIN_HEIGHT` | `256` | Minimum image height in pixels |
+| `LOG_LEVEL` | `INFO` | Log verbosity level |
+| `OBJECT_STORE_ENDPOINT` | `http://localhost:9000` | MinIO/S3 endpoint (reserved for Phase 3) |
+| `OBJECT_STORE_BUCKET` | `invisible-images` | MinIO/S3 bucket (reserved for Phase 3) |
+| `OBJECT_STORE_ACCESS_KEY` | `change-me` | MinIO/S3 access key (reserved for Phase 3) |
+| `OBJECT_STORE_SECRET_KEY` | `change-me` | MinIO/S3 secret key (reserved for Phase 3) |
+| `OBJECT_STORE_REGION` | `us-east-1` | MinIO/S3 region (reserved for Phase 3) |
+| `OBJECT_STORE_SECURE` | `false` | Use TLS for MinIO/S3 (reserved for Phase 3) |
 
 ---
 

@@ -315,11 +315,31 @@ class TestEndToEnd:
             headers={"Content-Type": "text/html; charset=utf-8"},
         )
 
-        # Parse and collect image items
-        image_items = []
+        # Parse and collect image Requests (spider now yields Requests, not items)
+        image_requests = []
         for item in spider.parse(response):
-            if isinstance(item, dict) and item.get("type") == "image":
-                image_items.append(item)
+            if isinstance(item, Request) and item.callback == spider.parse_image:
+                image_requests.append(item)
+
+        assert len(image_requests) == 2
+
+        # Simulate callback stage: call parse_image with mock responses
+        image_items = []
+        for img_request in image_requests:
+            # Create mock response for image
+            img_response = HtmlResponse(
+                url=img_request.url,
+                request=img_request,
+                body=b"",  # Image data will be fetched separately
+                headers={"Content-Type": "image/jpeg"},
+            )
+            # Copy metadata from request to response
+            img_response.meta.update(img_request.meta)
+
+            # Call parse_image callback to generate item
+            for item in spider.parse_image(img_response):
+                if isinstance(item, dict) and item.get("type") == "image":
+                    image_items.append(item)
 
         assert len(image_items) == 2
 

@@ -4,18 +4,16 @@ This module provides database connection management using psycopg2
 with connection pooling support.
 """
 
-import os
 from collections.abc import Generator
 from contextlib import contextmanager
 
 import psycopg2
-from dotenv import load_dotenv
 from psycopg2.extensions import connection
 from psycopg2.pool import ThreadedConnectionPool
 
-load_dotenv()
+from env_config import get_database_url
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/invisible")
+DATABASE_URL = get_database_url()
 
 # Global connection pool (initialized lazily)
 _connection_pool: ThreadedConnectionPool | None = None

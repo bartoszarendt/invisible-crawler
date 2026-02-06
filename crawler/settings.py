@@ -6,13 +6,15 @@ https://docs.scrapy.org/en/latest/topics/settings.html
 
 from pathlib import Path
 
+from env_config import get_crawler_user_agent, get_log_level, get_redis_url
+
 # Project settings
 BOT_NAME = "invisible-crawler"
 SPIDER_MODULES = ["crawler.spiders"]
 NEWSPIDER_MODULE = "crawler.spiders"
 
 # Crawl responsibly by identifying yourself
-USER_AGENT = "InvisibleCrawler/0.1 (Web crawler for image discovery research)"
+USER_AGENT = get_crawler_user_agent()
 
 # Obey robots.txt rules
 ROBOTSTXT_OBEY = True
@@ -85,7 +87,7 @@ RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
 DOWNLOAD_TIMEOUT = 30
 
 # Logging
-LOG_LEVEL = "INFO"
+LOG_LEVEL = get_log_level()
 
 # Project paths
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -113,8 +115,8 @@ SCHEDULER_QUEUE_KEY = "%(spider)s:requests"
 DUPEFILTER_CLASS = "scrapy_redis.dupefilter.RFPDupeFilter"
 DUPEFILTER_KEY = "%(spider)s:dupefilter"
 
-# Redis connection (configure via REDIS_URL env var)
-# REDIS_URL = "redis://localhost:6379/0"
+# Redis connection (from REDIS_URL env var)
+REDIS_URL = get_redis_url()
 
 # Serializer for queue items
 SCHEDULER_SERIALIZER = "scrapy_redis.picklecompat"

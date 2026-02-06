@@ -5,13 +5,13 @@ Handles downloading images from URLs with validation and error handling.
 
 import hashlib
 import logging
-import os
 from dataclasses import dataclass
 from io import BytesIO
 
 import requests
 from PIL import Image
 
+from env_config import get_crawler_user_agent
 from processor.media_policy import (
     REJECTION_REASON_FILE_TOO_LARGE,
     REJECTION_REASON_FILE_TOO_SMALL,
@@ -23,11 +23,6 @@ from processor.media_policy import (
 )
 
 logger = logging.getLogger(__name__)
-
-# User-Agent can be configured via environment variable for consistency with Scrapy settings
-DEFAULT_USER_AGENT = "InvisibleCrawler/0.1 (Image fetcher for research)"
-USER_AGENT = os.getenv("CRAWLER_USER_AGENT", DEFAULT_USER_AGENT)
-
 
 @dataclass
 class ImageFetchResult:
@@ -105,7 +100,7 @@ class ImageFetcher:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": USER_AGENT,
+                "User-Agent": get_crawler_user_agent(),
             }
         )
 

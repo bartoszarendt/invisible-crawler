@@ -1,16 +1,14 @@
 """Check if perceptual hashes are populated in the database."""
-import os
-from dotenv import load_dotenv
 import psycopg2
 
-load_dotenv()
+from env_config import get_database_url
 
-conn = psycopg2.connect(os.getenv('DATABASE_URL'))
+conn = psycopg2.connect(get_database_url())
 cur = conn.cursor()
 
 # Count images with hashes
 cur.execute("""
-    SELECT 
+    SELECT
         COUNT(*) as total,
         COUNT(phash_hash) as with_phash,
         COUNT(dhash_hash) as with_dhash
@@ -24,9 +22,9 @@ print(f"Images with dHash: {row[2]} ({100*row[2]/row[0] if row[0] > 0 else 0:.1f
 # Show sample hashes
 print("\nSample perceptual hashes:")
 cur.execute("""
-    SELECT url, phash_hash, dhash_hash 
-    FROM images 
-    WHERE phash_hash IS NOT NULL 
+    SELECT url, phash_hash, dhash_hash
+    FROM images
+    WHERE phash_hash IS NOT NULL
     LIMIT 5
 """)
 for idx, r in enumerate(cur.fetchall(), 1):

@@ -22,6 +22,7 @@ class MockRedis:
         self.data: dict[str, Any] = {}
         self.sets: dict[str, set] = {}
         self.hashes: dict[str, dict] = {}
+        self.sorted_sets: dict[str, list[tuple[Any, float]]] = {}  # key -> [(member, score), ...]
 
     def ping(self) -> bool:
         return True
@@ -66,7 +67,99 @@ class MockRedis:
         if key in self.hashes:
             del self.hashes[key]
             removed += 1
+        if key in self.sorted_sets:
+            del self.sorted_sets[key]
+            removed += 1
         return removed
+
+    def execute_command(self, *args: Any) -> Any:
+        """Execute Redis command (supports ZADD for sorted sets)."""
+        if not args:
+            return None
+
+        command = args[0].upper() if isinstance(args[0], str) else args[0]
+
+        if command == "ZADD":
+            # ZADD key score member [score member ...]
+            key = args[1]
+            if key not in self.sorted_sets:
+                self.sorted_sets[key] = []
+
+            # Parse score/member pairs
+            added = 0
+            i = 2
+            while i < len(args):
+                score = float(args[i])
+                member = args[i + 1]
+
+                # Check if member exists
+                existing = next((item for item in self.sorted_sets[key] if item[0] == member), None)
+                if existing:
+                    # Update score
+                    self.sorted_sets[key].remove(existing)
+                self.sorted_sets[key].append((member, score))
+                added += 1
+                i += 2
+
+            # Keep sorted by score
+            self.sorted_sets[key].sort(key=lambda x: x[1])
+            return added
+
+        return None
+
+    def zcard(self, key: str) -> int:
+        """Get cardinality (size) of sorted set."""
+        if key in self.sorted_sets:
+            return len(self.sorted_sets[key])
+        return 0
+
+    def zrange(self, key: str, start: int, end: int, withscores: bool = False) -> list:
+        """Get range of members from sorted set."""
+        if key not in self.sorted_sets:
+            return []
+
+        items = self.sorted_sets[key][start : end + 1 if end >= 0 else None]
+        if withscores:
+            return [(member, score) for member, score in items]
+        return [member for member, _ in items]
+
+    def zremrangebyrank(self, key: str, start: int, end: int) -> int:
+        """Remove members by rank range."""
+        if key not in self.sorted_sets:
+            return 0
+
+        original_len = len(self.sorted_sets[key])
+        if end >= 0:
+            del self.sorted_sets[key][start : end + 1]
+        else:
+            del self.sorted_sets[key][start:]
+        return original_len - len(self.sorted_sets[key])
+
+    def pipeline(self) -> "MockPipeline":
+        """Create a mock pipeline."""
+        return MockPipeline(self)
+
+
+class MockPipeline:
+    """Mock Redis pipeline for batched commands."""
+
+    def __init__(self, redis_client: MockRedis) -> None:
+        self.redis = redis_client
+        self.commands: list = []
+
+    def execute_command(self, *args: Any) -> "MockPipeline":
+        """Queue a command."""
+        self.commands.append(args)
+        return self
+
+    def execute(self) -> list:
+        """Execute all queued commands."""
+        results = []
+        for args in self.commands:
+            result = self.redis.execute_command(*args)
+            results.append(result)
+        self.commands.clear()
+        return results
 
 
 class TestInvisibleRedisScheduler:
@@ -108,6 +201,11 @@ class TestInvisibleRedisScheduler:
         self, scheduler: InvisibleRedisScheduler, mock_spider: Spider
     ) -> None:
         """Test enqueuing a new request."""
+        # Mock dupefilter before open to bypass scrapy-redis initialization
+        mock_df = MagicMock()
+        mock_df.request_seen = Mock(return_value=False)
+        scheduler.df = mock_df
+
         scheduler.open(mock_spider)
 
         request = Request(url="https://example.com/page1")
@@ -120,11 +218,13 @@ class TestInvisibleRedisScheduler:
         self, scheduler: InvisibleRedisScheduler, mock_spider: Spider
     ) -> None:
         """Test that duplicate requests are filtered."""
-        scheduler.open(mock_spider)
+        # Mock dupefilter before open to bypass scrapy-redis initialization
+        mock_df = MagicMock()
+        # First request is new, second is duplicate
+        mock_df.request_seen = Mock(side_effect=[False, True])
+        scheduler.df = mock_df
 
-        # Mock dupefilter to mark second request as seen
-        scheduler.df = MagicMock()
-        scheduler.df.request_seen = Mock(side_effect=[False, True])
+        scheduler.open(mock_spider)
 
         request1 = Request(url="https://example.com/page1")
         request2 = Request(url="https://example.com/page1")
@@ -140,6 +240,11 @@ class TestInvisibleRedisScheduler:
         self, scheduler: InvisibleRedisScheduler, mock_spider: Spider, mock_redis: MockRedis
     ) -> None:
         """Test domain tracking."""
+        # Mock dupefilter before open to bypass scrapy-redis initialization
+        mock_df = MagicMock()
+        mock_df.request_seen = Mock(return_value=False)
+        scheduler.df = mock_df
+
         scheduler.open(mock_spider)
         scheduler.spider = mock_spider
 
@@ -155,6 +260,11 @@ class TestInvisibleRedisScheduler:
         self, scheduler: InvisibleRedisScheduler, mock_spider: Spider
     ) -> None:
         """Test that refresh crawls get lower priority."""
+        # Mock dupefilter before open to bypass scrapy-redis initialization
+        mock_df = MagicMock()
+        mock_df.request_seen = Mock(return_value=False)
+        scheduler.df = mock_df
+
         scheduler.open(mock_spider)
 
         discovery_request = Request(

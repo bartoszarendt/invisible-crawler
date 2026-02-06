@@ -4,18 +4,15 @@ This module reads database configuration from environment variables
 to avoid storing credentials in version control.
 """
 
-import os
 from logging.config import fileConfig
 
 from alembic import context
-from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
-# Load environment variables from .env file
-load_dotenv()
+from env_config import get_database_url
 
 # Get database URL from environment
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/invisible")
+DATABASE_URL = get_database_url()
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

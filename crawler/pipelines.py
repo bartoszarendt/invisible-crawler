@@ -4,13 +4,17 @@ Pipelines process scraped items (images) and persist them to storage.
 """
 
 import logging
-import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from scrapy.exceptions import DropItem
 from scrapy.spiders import Spider
 
+from env_config import (
+    get_discovery_refresh_after_days,
+    get_image_min_height,
+    get_image_min_width,
+)
 from processor.async_fetcher import ScrapyImageDownloader
 from processor.fetcher import ImageFetcher, ImageFetchResult
 from processor.media_policy import (
@@ -65,7 +69,9 @@ class ImageProcessingPipeline:
         }
         self.downloader: ScrapyImageDownloader | None = None
         self.sync_fetcher: ImageFetcher | None = None
-        self.discovery_refresh_after_days = _get_int_env("DISCOVERY_REFRESH_AFTER_DAYS", 0)
+        self.discovery_refresh_after_days = get_discovery_refresh_after_days()
+        self.image_min_width = get_image_min_width()
+        self.image_min_height = get_image_min_height()
 
     @classmethod
     def from_crawler(cls, crawler: Any) -> "ImageProcessingPipeline":
@@ -106,9 +112,15 @@ class ImageProcessingPipeline:
             REJECTION_REASON_MISSING_RESPONSE: 0,
         }
         # Use async downloader that integrates with Scrapy
-        self.downloader = ScrapyImageDownloader()
+        self.downloader = ScrapyImageDownloader(
+            min_width=self.image_min_width,
+            min_height=self.image_min_height,
+        )
         # Keep sync fetcher for testing/standalone use
-        self.sync_fetcher = ImageFetcher()
+        self.sync_fetcher = ImageFetcher(
+            min_width=self.image_min_width,
+            min_height=self.image_min_height,
+        )
 
     def close_spider(self, spider: Spider) -> None:
         """Called when spider closes.
@@ -479,14 +491,3 @@ class ImageProcessingPipeline:
                 self._increment_rejection_reason(REJECTION_REASON_HTTP_ERROR)
             else:
                 self._increment_rejection_reason("unknown")
-
-
-def _get_int_env(name: str, default: int) -> int:
-    """Parse an int environment variable with a safe fallback."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
