@@ -15,6 +15,11 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from crawler.redis_keys import (
+    requests_key,
+    seen_domains_key,
+    start_urls_key,
+)
 from crawler.scheduler import check_redis_available
 from env_config import get_redis_url
 
@@ -116,8 +121,8 @@ def ingest_from_csv(
     }
 
     client = redis.from_url(redis_url)
-    queue_key = "discovery:start_urls"
-    seen_key = "discovery:seen_domains"
+    queue_key = start_urls_key("discovery")
+    seen_key = seen_domains_key("discovery")
 
     with open(source_file, encoding="utf-8") as f:
         reader = csv.reader(f)
@@ -252,12 +257,12 @@ def queue_status_command(args: argparse.Namespace) -> int:
         client = redis.from_url(redis_url)
 
         # Get queue info
-        start_urls_key = "discovery:start_urls"
-        requests_key = "discovery:requests"
-        seen_key = "discovery:seen_domains"
+        start_urls_redis_key = start_urls_key("discovery")
+        requests_redis_key = requests_key("discovery")
+        seen_key = seen_domains_key("discovery")
 
-        start_urls_size = client.zcard(start_urls_key)
-        requests_size = client.zcard(requests_key)
+        start_urls_size = client.zcard(start_urls_redis_key)
+        requests_size = client.zcard(requests_redis_key)
         seen_count = client.scard(seen_key)
 
         print("\nQueue Status:")
@@ -266,7 +271,7 @@ def queue_status_command(args: argparse.Namespace) -> int:
         print(f"  Unique domains seen: {seen_count}")
 
         # Get domain counts if available
-        domain_counts_key = "discovery:requests:domain_counts"
+        domain_counts_key = f"{requests_redis_key}:domain_counts"
         if client.exists(domain_counts_key):
             domain_counts = client.hgetall(domain_counts_key)
             print(f"  Per-domain pending: {len(domain_counts)} domains")

@@ -1,0 +1,123 @@
+name: invisible-crawler
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-invisible}
+      POSTGRES_USER: ${POSTGRES_USER:-invisible}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invisible}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-invisible} -d ${POSTGRES_DB:-invisible}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  crawler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      CRAWL_PROFILE: ${CRAWL_PROFILE:-conservative}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://invisible:invisible@postgres:5432/invisible}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      QUEUE_NAMESPACE: ${QUEUE_NAMESPACE:-}
+      CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-InvisibleCrawler/0.1 (Docker crawler; contact=you@example.com)}
+      CRAWLER_MAX_PAGES: ${CRAWLER_MAX_PAGES:-10}
+      DISCOVERY_REFRESH_AFTER_DAYS: ${DISCOVERY_REFRESH_AFTER_DAYS:-0}
+      IMAGE_MIN_WIDTH: ${IMAGE_MIN_WIDTH:-256}
+      IMAGE_MIN_HEIGHT: ${IMAGE_MIN_HEIGHT:-256}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SCRAPY_CONCURRENT_REQUESTS: ${SCRAPY_CONCURRENT_REQUESTS:-}
+      SCRAPY_CONCURRENT_REQUESTS_PER_DOMAIN: ${SCRAPY_CONCURRENT_REQUESTS_PER_DOMAIN:-}
+      SCRAPY_DOWNLOAD_DELAY: ${SCRAPY_DOWNLOAD_DELAY:-}
+      SCRAPY_RANDOMIZE_DOWNLOAD_DELAY: ${SCRAPY_RANDOMIZE_DOWNLOAD_DELAY:-true}
+      SCRAPY_AUTOTHROTTLE_ENABLED: ${SCRAPY_AUTOTHROTTLE_ENABLED:-true}
+      SCRAPY_AUTOTHROTTLE_START_DELAY: ${SCRAPY_AUTOTHROTTLE_START_DELAY:-}
+      SCRAPY_AUTOTHROTTLE_MAX_DELAY: ${SCRAPY_AUTOTHROTTLE_MAX_DELAY:-}
+      SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY: ${SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY:-}
+      SCRAPY_DOWNLOAD_TIMEOUT: ${SCRAPY_DOWNLOAD_TIMEOUT:-}
+      SCRAPY_RETRY_ENABLED: ${SCRAPY_RETRY_ENABLED:-true}
+      SCRAPY_RETRY_TIMES: ${SCRAPY_RETRY_TIMES:-}
+      WAIT_FOR_DEPENDENCIES: ${WAIT_FOR_DEPENDENCIES:-true}
+    command:
+      [
+        "sh",
+        "-c",
+        "exec scrapy crawl ${CRAWLER_SPIDER:-discovery} -a max_pages=${CRAWLER_MAX_PAGES:-10}",
+      ]
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'scrapy crawl' > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - crawler_state:/app/.scrapy
+      - crawler_logs:/app/logs
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://invisible:invisible@postgres:5432/invisible}
+      WAIT_FOR_DEPENDENCIES: ${WAIT_FOR_DEPENDENCIES:-true}
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    profiles: ["ops"]
+
+  seed_ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      QUEUE_NAMESPACE: ${QUEUE_NAMESPACE:-}
+      WAIT_FOR_DEPENDENCIES: ${WAIT_FOR_DEPENDENCIES:-true}
+    command:
+      [
+        "python",
+        "-m",
+        "crawler.cli",
+        "ingest-seeds",
+        "--source",
+        "${SEED_SOURCE:-tranco}",
+        "--limit",
+        "${SEED_LIMIT:-1000}",
+        "--offset",
+        "${SEED_OFFSET:-0}",
+      ]
+    restart: "no"
+    profiles: ["ops"]
+
+volumes:
+  postgres_data:
+  redis_data:
+  crawler_state:
+  crawler_logs:

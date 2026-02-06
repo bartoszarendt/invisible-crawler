@@ -15,6 +15,7 @@ from scrapy.utils.misc import load_object
 from scrapy_redis.queue import PriorityQueue
 from scrapy_redis.scheduler import Scheduler as RedisScheduler
 
+from crawler.redis_keys import domains_key
 from env_config import get_redis_url
 
 logger = logging.getLogger(__name__)
@@ -224,7 +225,7 @@ class InvisibleRedisScheduler(RedisScheduler):
             domain: Domain netloc.
         """
         # Use Redis set to track unique domains
-        key = f"{self.spider.name}:domains"
+        key = domains_key(self.spider.name)
         added = self.server.sadd(key, domain)
         if added:
             self.stats["domains_tracked"] += 1
@@ -263,7 +264,7 @@ class InvisibleRedisScheduler(RedisScheduler):
         """
         # Note: This is a placeholder. Full implementation would
         # require iterating through queue and removing domain-specific URLs.
-        key = f"{self.spider.name}:domains"
+        key = domains_key(self.spider.name)
         self.server.srem(key, domain)
         return 0
 

@@ -45,6 +45,24 @@ InvisibleCrawler fetches images from the web, generates stable fingerprints (SHA
    scrapy crawl discovery -a seeds=config/test_seeds.txt -a max_pages=100
    ```
 
+## Docker Compose (VPS/Long-Running)
+
+```bash
+# Copy environment template
+cp .env.prod.example .env.prod
+
+# Apply DB migrations
+docker compose --env-file .env.prod -f docker-compose.yml run --rm --profile ops migrate
+
+# (Optional) ingest seeds
+docker compose --env-file .env.prod -f docker-compose.yml run --rm --profile ops seed_ingest
+
+# Start stack
+docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for full architecture, update workflow, and rollback procedure.
+
 ## Development
 
 ### Environment Variables
@@ -58,6 +76,9 @@ InvisibleCrawler fetches images from the web, generates stable fingerprints (SHA
 | `IMAGE_MIN_WIDTH` | `256` | Minimum accepted image width |
 | `IMAGE_MIN_HEIGHT` | `256` | Minimum accepted image height |
 | `LOG_LEVEL` | `INFO` | Application log verbosity |
+| `APP_ENV` | `dev` | Deployment environment label (`dev`, `staging`, `prod`) |
+| `CRAWL_PROFILE` | `conservative` | Crawl behavior profile (`conservative`, `broad`) |
+| `QUEUE_NAMESPACE` | `` | Optional Redis key prefix for queue/version isolation |
 
 ### Code Quality
 
@@ -83,6 +104,7 @@ pytest tests/ --cov=crawler --cov=processor --cov-report=term-missing
 
 * [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) – Architecture and design principles
 * [IMPLEMENTATION.md](IMPLEMENTATION.md) – Phase 2 implementation details, runbook, and known gaps
+* [DEPLOYMENT.md](DEPLOYMENT.md) – Docker Compose deployment architecture and operations runbook
 * [AGENTS.md](AGENTS.md) – Agent guidelines and project conventions
 
 ## License

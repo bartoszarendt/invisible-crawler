@@ -11,7 +11,8 @@ from urllib.parse import urljoin, urlparse
 from scrapy import Spider, signals
 from scrapy.http import Request, Response, TextResponse
 
-from env_config import get_redis_url
+from crawler.redis_keys import start_urls_key
+from env_config import get_crawler_max_pages, get_redis_url
 from processor.media_policy import ALLOWED_EXTENSIONS
 from storage.db import get_cursor
 
@@ -30,12 +31,6 @@ class DiscoverySpider(Spider):
     """
 
     name = "discovery"
-
-    custom_settings = {
-        "ROBOTSTXT_OBEY": True,
-        "DOWNLOAD_DELAY": 1,
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
-    }
 
     @classmethod
     def from_crawler(cls, crawler: Any, *args: Any, **kwargs: Any) -> "DiscoverySpider":
@@ -72,7 +67,9 @@ class DiscoverySpider(Spider):
                     (self.crawl_type, "running", self.seeds_file or "redis"),
                 )
                 self.crawl_run_id = cursor.fetchone()[0]
-                self.logger.info(f"Created crawl run: {self.crawl_run_id} (mode: {self.crawl_type})")
+                self.logger.info(
+                    f"Created crawl run: {self.crawl_run_id} (mode: {self.crawl_type})"
+                )
         except Exception as e:
             self.logger.warning(f"Failed to create crawl run: {e}")
             self.crawl_run_id = None
@@ -86,7 +83,7 @@ class DiscoverySpider(Spider):
         """
         super().__init__(**kwargs)
         self.seeds_file = seeds
-        self.max_pages = int(kwargs.get("max_pages", 10))
+        self.max_pages = _get_int(kwargs.get("max_pages"), get_crawler_max_pages())
         self.allowlist_file = kwargs.get("allowlist", "config/seed_allowlist.txt")
         self.blocklist_file = kwargs.get("blocklist", "config/seed_blocklist.txt")
         self.max_domain_errors = _get_int(kwargs.get("max_domain_errors"), 3)
@@ -138,7 +135,9 @@ class DiscoverySpider(Spider):
 
         # Fall back to file-based seeds (Phase 1 mode)
         if not self.seeds_file:
-            self.logger.error("No seeds file provided and Redis start_urls empty. Use -a seeds=config/seeds.txt")
+            self.logger.error(
+                "No seeds file provided and Redis start_urls empty. Use -a seeds=config/seeds.txt"
+            )
             return
 
         seeds_path = Path(self.seeds_file)
@@ -190,10 +189,11 @@ class DiscoverySpider(Spider):
 
         try:
             import redis
+
             client = redis.from_url(redis_url, socket_connect_timeout=2)
 
             # Get URLs from sorted set (ordered by priority)
-            queue_key = f"{self.name}:start_urls"
+            queue_key = start_urls_key(self.name)
             # zrange returns members in order of score (priority)
             urls = client.zrange(queue_key, 0, -1)
 
@@ -227,17 +227,17 @@ class DiscoverySpider(Spider):
 
         # Check if response is HTML/text before parsing
         content_type = (
-            response.headers.get("Content-Type", b"")
-            .decode("utf-8", errors="ignore")
-            .lower()
+            response.headers.get("Content-Type", b"").decode("utf-8", errors="ignore").lower()
         )
         is_text_response = isinstance(response, TextResponse)
 
         # Be more permissive: try to parse if content-type suggests HTML or if it's a text response
         should_parse = (
-            is_text_response or
-            (content_type and ("html" in content_type or "text" in content_type)) or
-            (not content_type and len(response.body) > 0)  # Fallback for responses without content-type
+            is_text_response
+            or (content_type and ("html" in content_type or "text" in content_type))
+            or (
+                not content_type and len(response.body) > 0
+            )  # Fallback for responses without content-type
         )
 
         if not should_parse:
@@ -280,7 +280,7 @@ class DiscoverySpider(Spider):
             )
 
         # Follow same-domain links if we haven't reached max pages
-        if self.pages_crawled < self.max_pages:
+        if self.max_pages <= 0 or self.pages_crawled < self.max_pages:
             for next_url in self._extract_links(response, current_domain):
                 yield Request(
                     url=next_url,
@@ -528,11 +528,7 @@ class DiscoverySpider(Spider):
         except Exception:
             status = None
 
-        domain = (
-            urlparse(failure.request.url).netloc
-            if hasattr(failure, "request")
-            else "unknown"
-        )
+        domain = urlparse(failure.request.url).netloc if hasattr(failure, "request") else "unknown"
         if status in {403, 429, 503} and domain != "unknown":
             self._domain_error_counts[domain] = self._domain_error_counts.get(domain, 0) + 1
             if self._domain_error_counts[domain] >= self.max_domain_errors:
@@ -590,9 +586,13 @@ class DiscoverySpider(Spider):
                         ),
                     )
                     if cursor.rowcount == 0:
-                        self.logger.warning(f"Failed to update crawl_run {self.crawl_run_id}: row not found")
+                        self.logger.warning(
+                            f"Failed to update crawl_run {self.crawl_run_id}: row not found"
+                        )
                     else:
-                        self.logger.info(f"Updated crawl run: {self.crawl_run_id} (images_downloaded: {total_downloaded})")
+                        self.logger.info(
+                            f"Updated crawl run: {self.crawl_run_id} (images_downloaded: {total_downloaded})"
+                        )
             except Exception as e:
                 self.logger.warning(f"Failed to update crawl run: {e}")
 

@@ -4,14 +4,19 @@ Loads `.env` once at import time and exposes typed getters used across
 crawler, storage, and utility scripts.
 """
 
+import logging
 import os
+from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env", override=False)
+logger = logging.getLogger(__name__)
 
+DEFAULT_APP_ENV = "dev"
+DEFAULT_CRAWL_PROFILE = "conservative"
 DEFAULT_DATABASE_URL = "postgresql://localhost/invisible"
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 DEFAULT_CRAWLER_USER_AGENT = "InvisibleCrawler/0.1 (Web crawler for image discovery research)"
@@ -19,6 +24,31 @@ DEFAULT_DISCOVERY_REFRESH_AFTER_DAYS = 0
 DEFAULT_IMAGE_MIN_WIDTH = 256
 DEFAULT_IMAGE_MIN_HEIGHT = 256
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_QUEUE_NAMESPACE = ""
+
+# Conservative defaults tuned for local/dev runs.
+DEFAULT_SCRAPY_CONCURRENT_REQUESTS = 16
+DEFAULT_SCRAPY_CONCURRENT_REQUESTS_PER_DOMAIN = 1
+DEFAULT_SCRAPY_DOWNLOAD_DELAY = 1.0
+DEFAULT_SCRAPY_RANDOMIZE_DOWNLOAD_DELAY = True
+DEFAULT_SCRAPY_AUTOTHROTTLE_ENABLED = True
+DEFAULT_SCRAPY_AUTOTHROTTLE_START_DELAY = 1.0
+DEFAULT_SCRAPY_AUTOTHROTTLE_MAX_DELAY = 10.0
+DEFAULT_SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
+DEFAULT_SCRAPY_DOWNLOAD_TIMEOUT = 30
+DEFAULT_SCRAPY_RETRY_ENABLED = True
+DEFAULT_SCRAPY_RETRY_TIMES = 3
+
+# Broad profile defaults for VPS runs.
+BROAD_SCRAPY_CONCURRENT_REQUESTS = 64
+BROAD_SCRAPY_CONCURRENT_REQUESTS_PER_DOMAIN = 4
+BROAD_SCRAPY_DOWNLOAD_DELAY = 0.25
+BROAD_SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY = 4.0
+BROAD_SCRAPY_DOWNLOAD_TIMEOUT = 20
+BROAD_SCRAPY_RETRY_TIMES = 2
+DEFAULT_CRAWLER_MAX_PAGES = 10
+ALLOWED_APP_ENVS = {"dev", "staging", "prod"}
+ALLOWED_CRAWL_PROFILES = {"conservative", "broad"}
 
 
 def get_database_url() -> str:
@@ -29,6 +59,23 @@ def get_database_url() -> str:
 def get_redis_url() -> str:
     """Return Redis URL from environment with a safe local default."""
     return os.getenv("REDIS_URL", DEFAULT_REDIS_URL)
+
+
+@lru_cache(maxsize=1)
+def get_app_env() -> str:
+    """Return the deployment environment name."""
+    return get_choice_env("APP_ENV", DEFAULT_APP_ENV, ALLOWED_APP_ENVS)
+
+
+@lru_cache(maxsize=1)
+def get_crawl_profile() -> str:
+    """Return crawl tuning profile name."""
+    return get_choice_env("CRAWL_PROFILE", DEFAULT_CRAWL_PROFILE, ALLOWED_CRAWL_PROFILES)
+
+
+def is_broad_crawl_profile() -> bool:
+    """Return True when broad crawl profile is active."""
+    return get_crawl_profile() == "broad"
 
 
 def get_crawler_user_agent() -> str:
@@ -56,6 +103,97 @@ def get_log_level() -> str:
     return os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL)
 
 
+def get_queue_namespace() -> str:
+    """Return optional Redis key namespace prefix."""
+    return os.getenv("QUEUE_NAMESPACE", DEFAULT_QUEUE_NAMESPACE).strip().strip(":")
+
+
+def get_crawler_max_pages() -> int:
+    """Return default spider max_pages value used when no CLI arg is provided."""
+    return get_int_env("CRAWLER_MAX_PAGES", DEFAULT_CRAWLER_MAX_PAGES)
+
+
+def get_scrapy_concurrent_requests() -> int:
+    """Return Scrapy global request concurrency."""
+    profile_default = (
+        BROAD_SCRAPY_CONCURRENT_REQUESTS
+        if is_broad_crawl_profile()
+        else DEFAULT_SCRAPY_CONCURRENT_REQUESTS
+    )
+    return get_int_env("SCRAPY_CONCURRENT_REQUESTS", profile_default)
+
+
+def get_scrapy_concurrent_requests_per_domain() -> int:
+    """Return Scrapy per-domain request concurrency."""
+    profile_default = (
+        BROAD_SCRAPY_CONCURRENT_REQUESTS_PER_DOMAIN
+        if is_broad_crawl_profile()
+        else DEFAULT_SCRAPY_CONCURRENT_REQUESTS_PER_DOMAIN
+    )
+    return get_int_env("SCRAPY_CONCURRENT_REQUESTS_PER_DOMAIN", profile_default)
+
+
+def get_scrapy_download_delay() -> float:
+    """Return Scrapy DOWNLOAD_DELAY in seconds."""
+    profile_default = (
+        BROAD_SCRAPY_DOWNLOAD_DELAY if is_broad_crawl_profile() else DEFAULT_SCRAPY_DOWNLOAD_DELAY
+    )
+    return get_float_env("SCRAPY_DOWNLOAD_DELAY", profile_default)
+
+
+def get_scrapy_randomize_download_delay() -> bool:
+    """Return Scrapy RANDOMIZE_DOWNLOAD_DELAY toggle."""
+    return get_bool_env("SCRAPY_RANDOMIZE_DOWNLOAD_DELAY", DEFAULT_SCRAPY_RANDOMIZE_DOWNLOAD_DELAY)
+
+
+def get_scrapy_autothrottle_enabled() -> bool:
+    """Return Scrapy AUTOTHROTTLE_ENABLED toggle."""
+    return get_bool_env("SCRAPY_AUTOTHROTTLE_ENABLED", DEFAULT_SCRAPY_AUTOTHROTTLE_ENABLED)
+
+
+def get_scrapy_autothrottle_start_delay() -> float:
+    """Return Scrapy AUTOTHROTTLE_START_DELAY in seconds."""
+    return get_float_env("SCRAPY_AUTOTHROTTLE_START_DELAY", DEFAULT_SCRAPY_AUTOTHROTTLE_START_DELAY)
+
+
+def get_scrapy_autothrottle_max_delay() -> float:
+    """Return Scrapy AUTOTHROTTLE_MAX_DELAY in seconds."""
+    return get_float_env("SCRAPY_AUTOTHROTTLE_MAX_DELAY", DEFAULT_SCRAPY_AUTOTHROTTLE_MAX_DELAY)
+
+
+def get_scrapy_autothrottle_target_concurrency() -> float:
+    """Return Scrapy AUTOTHROTTLE_TARGET_CONCURRENCY."""
+    profile_default = (
+        BROAD_SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY
+        if is_broad_crawl_profile()
+        else DEFAULT_SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY
+    )
+    return get_float_env("SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY", profile_default)
+
+
+def get_scrapy_download_timeout() -> int:
+    """Return Scrapy DOWNLOAD_TIMEOUT in seconds."""
+    profile_default = (
+        BROAD_SCRAPY_DOWNLOAD_TIMEOUT
+        if is_broad_crawl_profile()
+        else DEFAULT_SCRAPY_DOWNLOAD_TIMEOUT
+    )
+    return get_int_env("SCRAPY_DOWNLOAD_TIMEOUT", profile_default)
+
+
+def get_scrapy_retry_enabled() -> bool:
+    """Return Scrapy RETRY_ENABLED toggle."""
+    return get_bool_env("SCRAPY_RETRY_ENABLED", DEFAULT_SCRAPY_RETRY_ENABLED)
+
+
+def get_scrapy_retry_times() -> int:
+    """Return Scrapy RETRY_TIMES."""
+    profile_default = (
+        BROAD_SCRAPY_RETRY_TIMES if is_broad_crawl_profile() else DEFAULT_SCRAPY_RETRY_TIMES
+    )
+    return get_int_env("SCRAPY_RETRY_TIMES", profile_default)
+
+
 def get_int_env(name: str, default: int) -> int:
     """Parse integer environment variable with fallback."""
     raw = os.getenv(name)
@@ -65,3 +203,47 @@ def get_int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def get_float_env(name: str, default: float) -> float:
+    """Parse float environment variable with fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def get_bool_env(name: str, default: bool) -> bool:
+    """Parse bool environment variable with fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def get_choice_env(name: str, default: str, allowed: set[str]) -> str:
+    """Parse enum-like env values with fallback to default on invalid input."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+    if value in allowed:
+        return value
+
+    logger.warning(
+        "Invalid %s value '%s'. Allowed values: %s. Falling back to '%s'.",
+        name,
+        raw,
+        ", ".join(sorted(allowed)),
+        default,
+    )
+    return default

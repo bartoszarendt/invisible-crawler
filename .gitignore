@@ -35,6 +35,9 @@ ENV/
 # Environment variables
 .env
 .env.local
+.env.dev
+.env.prod
+.env.staging
 
 # Database
 *.db
@@ -56,9 +59,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
-
-# Alembic config (contains db credentials)
-alembic.ini
 
 # Temp files
 *.tmp

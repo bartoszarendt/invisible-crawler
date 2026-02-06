@@ -1,0 +1,54 @@
+services:
+  postgres:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 768M
+        reservations:
+          cpus: "0.10"
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "25m"
+        max-file: "5"
+
+  redis:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          cpus: "0.05"
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "25m"
+        max-file: "5"
+
+  crawler:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+    command:
+      [
+        "sh",
+        "-c",
+        "exec scrapy crawl ${CRAWLER_SPIDER:-discovery} -a max_pages=${CRAWLER_MAX_PAGES:-0}",
+      ]

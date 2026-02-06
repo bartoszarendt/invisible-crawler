@@ -6,7 +6,23 @@ https://docs.scrapy.org/en/latest/topics/settings.html
 
 from pathlib import Path
 
-from env_config import get_crawler_user_agent, get_log_level, get_redis_url
+from crawler.redis_keys import dupefilter_key_pattern, requests_key_pattern
+from env_config import (
+    get_crawler_user_agent,
+    get_log_level,
+    get_redis_url,
+    get_scrapy_autothrottle_enabled,
+    get_scrapy_autothrottle_max_delay,
+    get_scrapy_autothrottle_start_delay,
+    get_scrapy_autothrottle_target_concurrency,
+    get_scrapy_concurrent_requests,
+    get_scrapy_concurrent_requests_per_domain,
+    get_scrapy_download_delay,
+    get_scrapy_download_timeout,
+    get_scrapy_randomize_download_delay,
+    get_scrapy_retry_enabled,
+    get_scrapy_retry_times,
+)
 
 # Project settings
 BOT_NAME = "invisible-crawler"
@@ -20,10 +36,14 @@ USER_AGENT = get_crawler_user_agent()
 ROBOTSTXT_OBEY = True
 
 # Configure a delay for requests for the same website (default: 0)
-DOWNLOAD_DELAY = 1  # 1 second between requests (conservative)
+DOWNLOAD_DELAY = get_scrapy_download_delay()
+RANDOMIZE_DOWNLOAD_DELAY = get_scrapy_randomize_download_delay()
+
+# Global and per-domain concurrency
+CONCURRENT_REQUESTS = get_scrapy_concurrent_requests()
 
 # The download delay setting will honor only one of:
-CONCURRENT_REQUESTS_PER_DOMAIN = 1
+CONCURRENT_REQUESTS_PER_DOMAIN = get_scrapy_concurrent_requests_per_domain()
 # CONCURRENT_REQUESTS_PER_IP = 1  # Deprecated, removed to avoid conflicts
 
 # Disable cookies (enabled by default)
@@ -57,10 +77,10 @@ ITEM_PIPELINES = {
 }
 
 # Enable and configure AutoThrottle extension (disabled by default)
-AUTOTHROTTLE_ENABLED = True
-AUTOTHROTTLE_START_DELAY = 1
-AUTOTHROTTLE_MAX_DELAY = 10
-AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
+AUTOTHROTTLE_ENABLED = get_scrapy_autothrottle_enabled()
+AUTOTHROTTLE_START_DELAY = get_scrapy_autothrottle_start_delay()
+AUTOTHROTTLE_MAX_DELAY = get_scrapy_autothrottle_max_delay()
+AUTOTHROTTLE_TARGET_CONCURRENCY = get_scrapy_autothrottle_target_concurrency()
 AUTOTHROTTLE_DEBUG = False
 
 # Enable showing throttling stats for every response received
@@ -79,12 +99,12 @@ TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
 
 # Retry configuration
-RETRY_ENABLED = True
-RETRY_TIMES = 3
+RETRY_ENABLED = get_scrapy_retry_enabled()
+RETRY_TIMES = get_scrapy_retry_times()
 RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
 
 # Timeout configuration
-DOWNLOAD_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = get_scrapy_download_timeout()
 
 # Logging
 LOG_LEVEL = get_log_level()
@@ -109,11 +129,11 @@ SCHEDULER_IDLE_BEFORE_CLOSE = 0  # Close immediately when queue empty
 
 # Queue class - supports priority and per-domain tracking
 SCHEDULER_QUEUE_CLASS = "crawler.scheduler.DomainPriorityQueue"
-SCHEDULER_QUEUE_KEY = "%(spider)s:requests"
+SCHEDULER_QUEUE_KEY = requests_key_pattern()
 
 # DupeFilter for URL deduplication
 DUPEFILTER_CLASS = "scrapy_redis.dupefilter.RFPDupeFilter"
-DUPEFILTER_KEY = "%(spider)s:dupefilter"
+DUPEFILTER_KEY = dupefilter_key_pattern()
 
 # Redis connection (from REDIS_URL env var)
 REDIS_URL = get_redis_url()

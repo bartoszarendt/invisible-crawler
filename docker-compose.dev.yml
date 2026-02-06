@@ -1,0 +1,21 @@
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  crawler:
+    restart: "no"
+    volumes:
+      - ./:/app
+      - crawler_state:/app/.scrapy
+      - crawler_logs:/app/logs
+    command:
+      [
+        "sh",
+        "-c",
+        "exec scrapy crawl ${CRAWLER_SPIDER:-discovery} -a max_pages=${CRAWLER_MAX_PAGES:-100} --loglevel=${LOG_LEVEL:-DEBUG}",
+      ]
