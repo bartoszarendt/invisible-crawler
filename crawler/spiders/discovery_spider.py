@@ -12,9 +12,24 @@ from scrapy import Spider, signals
 from scrapy.http import Request, Response, TextResponse
 
 from crawler.redis_keys import start_urls_key
-from env_config import get_crawler_max_pages, get_redis_url
+from env_config import (
+    get_crawler_max_pages,
+    get_default_max_pages_per_run,
+    get_domain_canonicalization_strip_subdomains,
+    get_enable_domain_tracking,
+    get_enable_per_domain_budget,
+    get_redis_url,
+)
+from processor.domain_canonicalization import canonicalize_domain
 from processor.media_policy import ALLOWED_EXTENSIONS
 from storage.db import get_cursor
+from storage.domain_repository import (
+    clear_frontier_checkpoint,
+    get_domain,
+    update_domain_stats,
+    update_frontier_checkpoint,
+    upsert_domain,
+)
 
 
 class DiscoverySpider(Spider):
@@ -92,12 +107,22 @@ class DiscoverySpider(Spider):
         self.images_found: int = 0
         self.pages_crawled: int = 0
         self.images_downloaded: int = 0  # Track successful downloads for crawl_runs
-        self.crawl_run_id: Any = None  # Track current crawl run
+        self.crawl_run_id = None  # Set in spider_opened
         self._domains: list[str] = []
         self._allowlist = self._load_domain_list(self.allowlist_file)
         self._blocklist = self._load_domain_list(self.blocklist_file)
         self._blocked_domains_runtime: set[str] = set()
         self._domain_error_counts: dict[str, int] = {}
+        # Domain tracking (Phase A)
+        self.enable_domain_tracking = get_enable_domain_tracking()
+        self.strip_subdomains = get_domain_canonicalization_strip_subdomains()
+        self._domain_stats: dict[str, dict[str, int]] = {}  # Track per-domain stats
+        self._blocked_domains_canonical: set[str] = set()  # Canonicalized blocked domains
+        # Per-domain budget tracking (Phase B)
+        self.enable_per_domain_budget = get_enable_per_domain_budget()
+        self.max_pages_per_run = get_default_max_pages_per_run()
+        self._domain_pages_crawled: dict[str, int] = {}  # Pages crawled per domain this run
+        self._domain_pending_urls: dict[str, list[dict[str, Any]]] = {}
 
     def start_requests(self) -> Any:
         """Generate initial requests from seed domains.
@@ -125,12 +150,21 @@ class DiscoverySpider(Spider):
                 self._domains.append(url)
                 self.logger.info(f"Adding seed domain: {url}")
 
-                yield Request(
-                    url=url,
-                    callback=self.parse,
-                    errback=self.handle_error,
-                    meta={"depth": 0, "domain": domain_netloc},
-                )
+                # Domain tracking: upsert domain before yielding
+                if self.enable_domain_tracking:
+                    try:
+                        canonical_domain = canonicalize_domain(url, self.strip_subdomains)
+                        upsert_domain(
+                            domain=canonical_domain,
+                            source="redis",
+                            seed_rank=None,
+                        )
+                        self.logger.debug(f"Upserted domain: {canonical_domain} (source: redis)")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to upsert domain for {url}: {e}")
+
+                # Yield requests (with checkpoint resume if enabled)
+                yield from self._yield_start_requests(url, domain_netloc)
             return
 
         # Fall back to file-based seeds (Phase 1 mode)
@@ -171,13 +205,21 @@ class DiscoverySpider(Spider):
                 self._domains.append(domain)
                 self.logger.info(f"Adding seed domain: {domain}")
 
-                # Start crawling from root
-                yield Request(
-                    url=domain,
-                    callback=self.parse,
-                    errback=self.handle_error,
-                    meta={"depth": 0, "domain": urlparse(domain).netloc},
-                )
+                # Domain tracking: upsert domain before yielding
+                if self.enable_domain_tracking:
+                    try:
+                        canonical_domain = canonicalize_domain(domain, self.strip_subdomains)
+                        upsert_domain(
+                            domain=canonical_domain,
+                            source=self.seeds_file or "file",
+                            seed_rank=None,
+                        )
+                        self.logger.debug(f"Upserted domain: {canonical_domain} (source: file)")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to upsert domain for {domain}: {e}")
+
+                # Yield requests (with checkpoint resume if enabled)
+                yield from self._yield_start_requests(domain, urlparse(domain).netloc)
 
     def _get_redis_start_urls(self) -> list[str]:
         """Fetch start URLs from Redis sorted set.
@@ -202,6 +244,95 @@ class DiscoverySpider(Spider):
         except Exception as e:
             self.logger.debug(f"Could not fetch Redis start_urls: {e}")
             return []
+
+    def _yield_start_requests(self, url: str, domain_netloc: str) -> Any:
+        """Yield start requests for a domain, with optional checkpoint resume.
+
+        When per-domain budgets are enabled and a checkpoint exists for the domain,
+        loads pending URLs from the checkpoint and yields those instead of the root URL.
+
+        Args:
+            url: Root URL of the domain
+            domain_netloc: Domain netloc for meta
+
+        Yields:
+            Request objects for the domain (from checkpoint or fresh start)
+        """
+        # Check for checkpoint if per-domain budget is enabled
+        if self.enable_per_domain_budget and self.enable_domain_tracking:
+            try:
+                canonical_domain = canonicalize_domain(url, self.strip_subdomains)
+                domain_row = get_domain(canonical_domain)
+
+                if domain_row and domain_row.get("frontier_checkpoint_id"):
+                    checkpoint_id = domain_row["frontier_checkpoint_id"]
+                    self.logger.info(f"Found checkpoint for {canonical_domain}: {checkpoint_id}")
+
+                    # Load checkpoint from Redis
+                    try:
+                        import redis
+
+                        redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
+                        from storage.frontier_checkpoint import (
+                            delete_checkpoint,
+                            load_checkpoint,
+                        )
+
+                        checkpoint_urls = load_checkpoint(checkpoint_id, redis_client)
+
+                        if checkpoint_urls:
+                            self.logger.info(
+                                f"Resuming {canonical_domain} from checkpoint: "
+                                f"{len(checkpoint_urls)} URLs"
+                            )
+
+                            for entry in checkpoint_urls:
+                                yield Request(
+                                    url=entry["url"],
+                                    callback=self.parse,
+                                    errback=self.handle_error,
+                                    meta={
+                                        "depth": entry["depth"],
+                                        "domain": domain_netloc,
+                                    },
+                                )
+
+                            # Clear checkpoint after successful load
+                            # NOTE: This deletes the checkpoint immediately, which means
+                            # if the spider crashes before processing all resumed URLs,
+                            # those URLs are lost. This is acceptable for Phase B because:
+                            # 1. Worst case is re-crawling pages from root, not data loss
+                            # 2. A new checkpoint will be created if budget is hit again
+                            # 3. Phase C will implement more robust claim/lease protocols
+                            delete_checkpoint(checkpoint_id, redis_client)
+                            clear_frontier_checkpoint(canonical_domain)
+                            self.logger.info(
+                                f"Cleared checkpoint for {canonical_domain} after resume"
+                            )
+                            return  # Don't yield root URL, we resumed from checkpoint
+                        else:
+                            self.logger.warning(
+                                f"Checkpoint {checkpoint_id} empty or not found, starting fresh"
+                            )
+                            clear_frontier_checkpoint(canonical_domain)
+
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Failed to load checkpoint for {canonical_domain}: {e}. "
+                            f"Falling back to root URL."
+                        )
+                        # Continue to yield root URL below
+
+            except Exception as e:
+                self.logger.debug(f"Could not check for checkpoint: {e}")
+
+        # Fresh start: yield root URL
+        yield Request(
+            url=url,
+            callback=self.parse,
+            errback=self.handle_error,
+            meta={"depth": 0, "domain": domain_netloc},
+        )
 
     def parse(self, response: Response) -> Any:
         """Parse HTML page and extract images and links.
@@ -246,11 +377,32 @@ class DiscoverySpider(Spider):
 
         if self.block_on_login and self._looks_like_login_page(response):
             self._mark_domain_blocked(current_domain, "login_required")
+            # Also track canonicalized version for domain stats
+            if self.enable_domain_tracking:
+                try:
+                    canonical_domain = canonicalize_domain(current_domain, self.strip_subdomains)
+                    self._blocked_domains_canonical.add(canonical_domain)
+                except Exception:
+                    pass
             return
 
         # Extract image URLs from the page
         image_urls = self._extract_image_urls(response, current_domain)
         self.images_found += len(image_urls)
+
+        # Domain tracking: update per-domain stats
+        if self.enable_domain_tracking:
+            try:
+                canonical_domain = canonicalize_domain(current_domain, self.strip_subdomains)
+                if canonical_domain not in self._domain_stats:
+                    self._domain_stats[canonical_domain] = {
+                        "pages": 0,
+                        "images_found": 0,
+                    }
+                self._domain_stats[canonical_domain]["pages"] += 1
+                self._domain_stats[canonical_domain]["images_found"] += len(image_urls)
+            except Exception as e:
+                self.logger.debug(f"Failed to update domain stats for {current_domain}: {e}")
 
         self.logger.info(f"Found {len(image_urls)} images on {response.url}")
 
@@ -279,15 +431,50 @@ class DiscoverySpider(Spider):
                 dont_filter=False,
             )
 
-        # Follow same-domain links if we haven't reached max pages
-        if self.max_pages <= 0 or self.pages_crawled < self.max_pages:
-            for next_url in self._extract_links(response, current_domain):
+        # Extract links before budget check so we can track them
+        extracted_links = self._extract_links(response, current_domain)
+
+        # Check budget BEFORE incrementing counter (so current page is allowed)
+        if self.enable_per_domain_budget:
+            pages_crawled_before = self._domain_pages_crawled.get(current_domain, 0)
+            # 0 means unlimited budget
+            if self.max_pages_per_run > 0 and pages_crawled_before >= self.max_pages_per_run:
+                self.logger.info(
+                    f"Domain {current_domain} reached budget: "
+                    f"{pages_crawled_before}/{self.max_pages_per_run} pages"
+                )
+                should_yield_links = False
+            else:
+                should_yield_links = True
+        elif self.max_pages > 0 and self.pages_crawled >= self.max_pages:
+            # Global budget check (Phase A behavior)
+            should_yield_links = False
+        else:
+            should_yield_links = True
+
+        # Now increment the counter for this page
+        if self.enable_per_domain_budget:
+            self._domain_pages_crawled[current_domain] = (
+                self._domain_pages_crawled.get(current_domain, 0) + 1
+            )
+
+            # Always track URLs for potential checkpoint
+            for next_url in extracted_links:
+                next_depth = current_depth + 1
+                self._domain_pending_urls.setdefault(current_domain, []).append(
+                    {"url": next_url, "depth": next_depth}
+                )
+
+        # Yield links if budget permits
+        if should_yield_links:
+            for next_url in extracted_links:
+                next_depth = current_depth + 1
                 yield Request(
                     url=next_url,
                     callback=self.parse,
                     errback=self.handle_error,
                     meta={
-                        "depth": current_depth + 1,
+                        "depth": next_depth,
                         "domain": current_domain,
                     },
                 )
@@ -533,6 +720,13 @@ class DiscoverySpider(Spider):
             self._domain_error_counts[domain] = self._domain_error_counts.get(domain, 0) + 1
             if self._domain_error_counts[domain] >= self.max_domain_errors:
                 self._mark_domain_blocked(domain, f"too_many_errors_{status}")
+                # Also track canonicalized version for domain stats
+                if self.enable_domain_tracking:
+                    try:
+                        canonical_domain = canonicalize_domain(domain, self.strip_subdomains)
+                        self._blocked_domains_canonical.add(canonical_domain)
+                    except Exception:
+                        pass
 
         # Best-effort crawl log for failures
         self._log_crawl_entry(
@@ -595,6 +789,72 @@ class DiscoverySpider(Spider):
                         )
             except Exception as e:
                 self.logger.warning(f"Failed to update crawl run: {e}")
+
+        # Phase B: Save frontier checkpoints for domains with pending URLs
+        if (
+            self.enable_per_domain_budget
+            and self.enable_domain_tracking
+            and self._domain_pending_urls
+        ):
+            try:
+                import redis
+
+                redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
+                from storage.frontier_checkpoint import save_checkpoint
+
+                run_id_str = str(self.crawl_run_id) if self.crawl_run_id else "unknown"
+
+                for domain, pending_urls in self._domain_pending_urls.items():
+                    # Only save checkpoint if domain actually hit its budget
+                    # (and budget is not unlimited - max_pages_per_run=0 means unlimited)
+                    pages_crawled = self._domain_pages_crawled.get(domain, 0)
+                    if (
+                        pending_urls
+                        and self.max_pages_per_run > 0
+                        and pages_crawled >= self.max_pages_per_run
+                    ):
+                        try:
+                            canonical_domain = canonicalize_domain(domain, self.strip_subdomains)
+                            checkpoint_id = save_checkpoint(
+                                canonical_domain, run_id_str, pending_urls, redis_client
+                            )
+                            update_frontier_checkpoint(
+                                canonical_domain, checkpoint_id, len(pending_urls)
+                            )
+                            self.logger.info(
+                                f"Saved frontier checkpoint for {domain}: "
+                                f"{len(pending_urls)} URLs (checkpoint: {checkpoint_id})"
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Failed to save checkpoint for {domain}: {e}")
+
+            except Exception as e:
+                self.logger.warning(f"Could not save frontier checkpoints: {e}")
+
+        # Domain tracking: update domain stats for all crawled domains
+        if self.enable_domain_tracking and self._domain_stats:
+            try:
+                self.logger.info(f"Updating domain stats for {len(self._domain_stats)} domains...")
+                for domain, stats in self._domain_stats.items():
+                    # Determine status based on crawl outcome using canonicalized blocked set
+                    if domain in self._blocked_domains_canonical:
+                        status = "blocked"
+                    else:
+                        status = "active"  # Simple for Phase A
+
+                    update_domain_stats(
+                        domain=domain,
+                        pages_crawled_delta=stats["pages"],
+                        images_found_delta=stats["images_found"],
+                        status=status,
+                        last_crawl_run_id=str(self.crawl_run_id) if self.crawl_run_id else None,
+                    )
+                    self.logger.debug(
+                        f"Updated domain stats: {domain} (pages: {stats['pages']}, images: {stats['images_found']})"
+                    )
+                self.logger.info(f"Domain stats updated for {len(self._domain_stats)} domains")
+            except Exception as e:
+                self.logger.warning(f"Failed to update domain stats: {e}")
 
         self.logger.info("=" * 50)
         self.logger.info(f"Spider closed: {reason}")

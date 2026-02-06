@@ -284,6 +284,77 @@ def queue_status_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def backfill_domains_command(args: argparse.Namespace) -> int:
+    """Backfill domains table from historical crawl_log data.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
+    dry_run = args.dry_run
+
+    try:
+        from storage.domain_repository import backfill_domains_from_crawl_log
+
+        if dry_run:
+            logger.info("DRY RUN: Would backfill domains from crawl_log")
+            return 0
+
+        logger.info("Starting backfill of domains from crawl_log...")
+        stats = backfill_domains_from_crawl_log()
+
+        logger.info("=" * 50)
+        logger.info("Backfill Complete:")
+        logger.info(f"  Domains created/updated: {stats['domains_created']}")
+        logger.info(f"  Domains with image counts: {stats['images_stored_updated']}")
+        logger.info("=" * 50)
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Backfill failed: {e}")
+        return 1
+
+
+def domain_status_command(args: argparse.Namespace) -> int:
+    """Show domain status summary.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
+    try:
+        from storage.domain_repository import get_domain_stats_summary
+
+        stats = get_domain_stats_summary()
+
+        if "error" in stats:
+            logger.error(f"Failed to get domain stats: {stats['error']}")
+            return 1
+
+        print(f"\n{'STATUS':<15} {'COUNT':<10} {'AVG PAGES':<12} {'TOTAL IMAGES':<15}")
+        print("-" * 55)
+
+        for status, data in sorted(stats["by_status"].items()):
+            print(
+                f"{status:<15} {data['count']:<10} {data['avg_pages'] or 0:<12} {data['total_images'] or 0:<15}"
+            )
+
+        print("-" * 55)
+        print(f"{'TOTAL':<15} {stats['total_domains']:<10} {'':<12} {stats['total_images']:<15}")
+        print()
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to get domain status: {e}")
+        return 1
+
+
 def main() -> int:
     """Main CLI entry point.
 
@@ -356,6 +427,25 @@ def main() -> int:
         help="Redis connection URL (default: from REDIS_URL env var)",
     )
     queue_parser.set_defaults(func=queue_status_command)
+
+    # backfill-domains command
+    backfill_parser = subparsers.add_parser(
+        "backfill-domains",
+        help="Backfill domains table from historical crawl_log data",
+    )
+    backfill_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+    backfill_parser.set_defaults(func=backfill_domains_command)
+
+    # domain-status command
+    domain_parser = subparsers.add_parser(
+        "domain-status",
+        help="Show domain tracking status summary",
+    )
+    domain_parser.set_defaults(func=domain_status_command)
 
     args = parser.parse_args()
 

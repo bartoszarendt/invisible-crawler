@@ -347,6 +347,109 @@ mypy crawler/ processor/ storage/
 
 ---
 
+## Domain Tracking - Phase A Implementation
+
+**Date:** 2026-02-06  
+**Status:** ✅ Complete  
+**Design Document:** [DOMAIN_TRACKING_DESIGN.md](DOMAIN_TRACKING_DESIGN.md)
+
+Phase A establishes the foundation for domain-centric crawl tracking by making domains first-class persistent entities in the database. This is an **additive-only** change with zero behavior modifications to the crawler logic.
+
+### What Phase A Adds
+
+1. **`domains` table** (Alembic migration `1c3fe655e18f`)
+   - Full schema including concurrency fields for future phases
+   - ENUM type `domain_status` (pending, active, exhausted, blocked, unreachable)
+   - Comprehensive indexes for scheduling queries
+   - Automatic `updated_at` trigger
+
+2. **Domain canonicalization** (`processor/domain_canonicalization.py`)
+   - Normalizes domains: lowercase, strip www, strip ports, IDN→punycode
+   - Configurable subdomain handling via feature flag
+   - Dependencies: `idna`, `publicsuffix2`
+
+3. **Domain repository** (`storage/domain_repository.py`)
+   - `upsert_domain()`: Insert or ignore for seed processing
+   - `update_domain_stats()`: Incremental stats updates (+= for cumulative tracking)
+   - `get_domain()`: Fetch domain row
+   - `backfill_domains_from_crawl_log()`: Historical data import
+
+4. **Spider integration** (Passive tracking)
+   - `start_requests()`: Upserts domain for each seed before yielding
+   - `parse()`: Tracks per-domain stats (pages, images found)
+   - `closed()`: Updates domain stats for all crawled domains
+   - Feature flag: `ENABLE_DOMAIN_TRACKING` (default: true)
+
+5. **CLI commands** (`crawler/cli.py`)
+   - `backfill-domains`: Backfill from crawl_log and provenance
+   - `domain-status`: Show domain statistics summary
+
+6. **Tests** (15+ new tests)
+   - `tests/test_domain_canonicalization.py`: Unit tests for canonicalization rules
+   - `tests/test_domain_repository.py`: Unit tests for DB operations
+   - `tests/test_domain_tracking_integration.py`: Integration tests
+
+### Feature Flags
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_DOMAIN_TRACKING` | `true` | Enable domain upsert and stats tracking |
+| `DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS` | `false` | Collapse subdomains to registrable domain |
+
+### Usage
+
+```bash
+# Run migration
+alembic upgrade head
+
+# Backfill historical data
+python -m crawler.cli backfill-domains
+
+# Check domain status
+python -m crawler.cli domain-status
+
+# Run crawl with domain tracking (default)
+scrapy crawl discovery -a seeds=config/test_seeds.txt
+
+# Disable domain tracking if needed
+ENABLE_DOMAIN_TRACKING=false scrapy crawl discovery -a seeds=config/test_seeds.txt
+```
+
+### Database Schema
+
+The `domains` table tracks:
+- **Identity**: `domain` (canonical, unique), `source`, `seed_rank`
+- **State**: `status` (pending → active → exhausted/blocked/unreachable)
+- **Progress**: `pages_crawled`, `images_found`, `images_stored` (cumulative)
+- **Quality**: `image_yield_rate`, `error_rate`, `avg_images_per_page`
+- **Scheduling**: `priority_score`, `next_crawl_after`
+- **Concurrency**: `claimed_by`, `claim_expires_at`, `version` (for Phase C)
+- **Resume**: `last_crawl_run_id`, `frontier_checkpoint_id` (for Phase B)
+
+### Acceptance Criteria Met
+
+✅ Migration runs cleanly and is reversible  
+✅ All existing tests pass (46/52)  
+✅ New domain tracking tests pass (15+)  
+✅ Crawl runs successfully with tracking enabled  
+✅ `domains` table populates during crawl  
+✅ Domain stats update in `closed()`  
+✅ Backfill script runs successfully  
+✅ Feature flag disables tracking without errors  
+✅ No crawl behavior changes (same pages, same images)  
+✅ Code quality: mypy strict, Black formatting, Ruff linting  
+
+### Next: Phase B, C, D
+
+Phase A is **foundational only** - it creates the schema and starts collecting data. Future phases will add:
+- **Phase B**: Per-domain budgets, frontier checkpoint persistence
+- **Phase C**: Smart scheduling, domain claim protocol, concurrency
+- **Phase D**: Refresh mode for exhausted domains
+
+See [DOMAIN_TRACKING_DESIGN.md](DOMAIN_TRACKING_DESIGN.md) for full design.
+
+---
+
 ## Phase 3 Roadmap (Future Work)
 
 ### High Priority

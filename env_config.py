@@ -48,6 +48,15 @@ BROAD_SCRAPY_DOWNLOAD_TIMEOUT = 20
 BROAD_SCRAPY_RETRY_TIMES = 2
 DEFAULT_CRAWLER_MAX_PAGES = 10
 ALLOWED_APP_ENVS = {"dev", "staging", "prod"}
+
+# Domain tracking feature flags (Phase A)
+DEFAULT_ENABLE_DOMAIN_TRACKING = True
+DEFAULT_DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS = False
+
+# Per-domain budget feature flags (Phase B)
+DEFAULT_ENABLE_PER_DOMAIN_BUDGET = False
+DEFAULT_MAX_PAGES_PER_RUN = 1000
+
 ALLOWED_CRAWL_PROFILES = {"conservative", "broad"}
 
 
@@ -247,3 +256,52 @@ def get_choice_env(name: str, default: str, allowed: set[str]) -> str:
         default,
     )
     return default
+
+
+def get_enable_domain_tracking() -> bool:
+    """Return whether domain tracking is enabled.
+
+    When enabled, the spider will:
+    - Upsert domain rows during start_requests
+    - Update domain stats in closed()
+
+    Default: True
+    """
+    return get_bool_env("ENABLE_DOMAIN_TRACKING", DEFAULT_ENABLE_DOMAIN_TRACKING)
+
+
+def get_domain_canonicalization_strip_subdomains() -> bool:
+    """Return whether to strip subdomains during canonicalization.
+
+    When True: blog.example.com -> example.com
+    When False: blog.example.com -> blog.example.com (keeps full subdomain)
+
+    Default: False (keep full subdomains)
+    """
+    return get_bool_env(
+        "DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS",
+        DEFAULT_DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS,
+    )
+
+
+def get_enable_per_domain_budget() -> bool:
+    """Return whether per-domain budget enforcement is enabled (Phase B).
+
+    When enabled:
+    - Each domain gets max_pages_per_run pages instead of global max_pages
+    - Frontier checkpoints are saved when budget is exhausted
+    - Domains can resume from checkpoint on next run
+
+    Default: False (use global max_pages for backward compatibility)
+    """
+    return get_bool_env("ENABLE_PER_DOMAIN_BUDGET", DEFAULT_ENABLE_PER_DOMAIN_BUDGET)
+
+
+def get_default_max_pages_per_run() -> int:
+    """Return default maximum pages to crawl per domain per run.
+
+    Only applies when per-domain budgets are enabled.
+
+    Default: 1000
+    """
+    return get_int_env("MAX_PAGES_PER_RUN", DEFAULT_MAX_PAGES_PER_RUN)

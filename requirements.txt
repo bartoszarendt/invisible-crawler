@@ -16,3 +16,7 @@ minio>=7.2.0
 
 # Redis scheduler
 scrapy-redis>=0.9.0
+
+# Domain canonicalization
+idna>=3.6
+publicsuffix2>=2.20191221
