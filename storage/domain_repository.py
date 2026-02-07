@@ -863,3 +863,181 @@ def get_active_claims() -> list[dict[str, Any]]:
     except Exception as e:
         logger.error(f"Failed to get active claims: {e}")
         return []
+
+
+def preview_claims_by_worker(worker_id: str) -> list[dict[str, Any]]:
+    """Preview domains claimed by a specific worker.
+
+    Args:
+        worker_id: Worker identifier.
+
+    Returns:
+        List of domain dicts claimed by the worker.
+    """
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, domain, status, pages_crawled, claim_expires_at
+                FROM domains
+                WHERE claimed_by = %s
+                ORDER BY claim_expires_at
+                """,
+                (worker_id,),
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": row[0],
+                    "domain": row[1],
+                    "status": row[2],
+                    "pages_crawled": row[3],
+                    "claim_expires_at": row[4],
+                }
+                for row in rows
+            ]
+    except Exception as e:
+        logger.error(f"Failed to preview claims for worker {worker_id}: {e}")
+        return []
+
+
+def force_release_worker_claims(worker_id: str) -> int:
+    """Force-release all claims for a specific worker (active or expired).
+
+    Args:
+        worker_id: Worker identifier.
+
+    Returns:
+        Number of claims released.
+    """
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE domains
+                SET claimed_by = NULL,
+                    claim_expires_at = NULL
+                WHERE claimed_by = %s
+                RETURNING id
+                """,
+                (worker_id,),
+            )
+            count = cur.rowcount
+            if count > 0:
+                logger.info(f"Force-released {count} claims for worker: {worker_id}")
+            return count
+    except Exception as e:
+        logger.error(f"Failed to force-release claims for worker {worker_id}: {e}")
+        return 0
+
+
+def force_release_all_claims() -> int:
+    """Force-release all active claims (emergency recovery).
+
+    WARNING: This releases ALL claims, including from running workers.
+    Should only be used when all workers are known to be stopped.
+
+    Returns:
+        Number of claims released.
+    """
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE domains
+                SET claimed_by = NULL,
+                    claim_expires_at = NULL
+                WHERE claimed_by IS NOT NULL
+                RETURNING id
+                """
+            )
+            count = cur.rowcount
+            if count > 0:
+                logger.warning(f"Force-released ALL {count} claims globally")
+            return count
+    except Exception as e:
+        logger.error(f"Failed to force-release all claims: {e}")
+        return 0
+
+
+def increment_domain_stats_claimed(
+    domain_id: int,
+    worker_id: str,
+    pages_crawled_delta: int = 0,
+    images_found_delta: int = 0,
+    images_stored_delta: int = 0,
+    total_error_count_delta: int = 0,
+    crawl_run_id: int | None = None,
+) -> bool:
+    """Increment domain stats for a CLAIMED domain (optimistic locking).
+
+    This method is safe for mid-crawl incremental updates. It only updates
+    domains that are currently claimed BY THE SPECIFIC WORKER (for security)
+    and uses atomic increments to prevent race conditions.
+
+    Args:
+        domain_id: Domain ID (from claim).
+        worker_id: Worker ID that must own the claim.
+        pages_crawled_delta: Pages to add.
+        images_found_delta: Images to add.
+        images_stored_delta: Images stored to add.
+        total_error_count_delta: Errors to add.
+        crawl_run_id: Current crawl run ID.
+
+    Returns:
+        True if update succeeded, False if claim lost or domain not found.
+    """
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE domains
+                SET pages_crawled = pages_crawled + %s,
+                    images_found = images_found + %s,
+                    images_stored = images_stored + %s,
+                    total_error_count = total_error_count + %s,
+                    last_crawled_at = CURRENT_TIMESTAMP,
+                    last_crawl_run_id = COALESCE(%s, last_crawl_run_id)
+                WHERE id = %s
+                  AND claimed_by = %s  -- Safety: only domains claimed by this worker
+                RETURNING id
+                """,
+                (
+                    pages_crawled_delta,
+                    images_found_delta,
+                    images_stored_delta,
+                    total_error_count_delta,
+                    str(crawl_run_id) if crawl_run_id else None,
+                    domain_id,
+                    worker_id,
+                ),
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.error(f"Failed to increment stats for domain {domain_id}: {e}")
+        return False
+
+
+def increment_crawl_run_stats(
+    crawl_run_id: int, pages_delta: int = 0, images_delta: int = 0
+) -> None:
+    """Increment crawl_run stats incrementally (for mid-crawl flushing).
+
+    Args:
+        crawl_run_id: Crawl run ID.
+        pages_delta: Pages to add to pages_crawled.
+        images_delta: Images to add to images_found.
+    """
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE crawl_runs
+                SET pages_crawled = pages_crawled + %s,
+                    images_found = images_found + %s
+                WHERE id = %s
+                """,
+                (pages_delta, images_delta, crawl_run_id),
+            )
+    except Exception as e:
+        logger.error(f"Failed to increment run stats for {crawl_run_id}: {e}")

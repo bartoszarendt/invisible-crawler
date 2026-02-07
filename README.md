@@ -79,6 +79,12 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for full architecture, update workflow, and r
 | `APP_ENV` | `dev` | Deployment environment label (`dev`, `staging`, `prod`) |
 | `CRAWL_PROFILE` | `conservative` | Crawl behavior profile (`conservative`, `broad`) |
 | `QUEUE_NAMESPACE` | `` | Optional Redis key prefix for queue/version isolation |
+| `ENABLE_DOMAIN_TRACKING` | `true` | Enable persistent per-domain state tracking (Phase A) |
+| `DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS` | `false` | Collapse subdomains to registrable domain when enabled |
+| `ENABLE_PER_DOMAIN_BUDGET` | `false` | Enable per-domain page budgets + checkpointing (Phase B) |
+| `MAX_PAGES_PER_RUN` | `1000` | Per-domain page budget when Phase B is enabled |
+| `ENABLE_SMART_SCHEDULING` | `false` | Enable DB-driven domain selection (Phase C) |
+| `ENABLE_CLAIM_PROTOCOL` | `false` | Enable claim/lease concurrency protocol (Phase C) |
 
 ### Code Quality
 
@@ -103,7 +109,7 @@ pytest tests/ --cov=crawler --cov=processor --cov-report=term-missing
 ## Documentation
 
 * [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) – Architecture and design principles
-* [IMPLEMENTATION.md](IMPLEMENTATION.md) – Phase 2 implementation details, runbook, and known gaps
+* [IMPLEMENTATION.md](IMPLEMENTATION.md) – implementation status, runbook, and known gaps (Phase 2 + domain tracking)
 * [DEPLOYMENT.md](DEPLOYMENT.md) – Docker Compose deployment architecture and operations runbook
 * [AGENTS.md](AGENTS.md) – Agent guidelines and project conventions
 

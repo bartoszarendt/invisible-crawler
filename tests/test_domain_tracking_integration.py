@@ -23,15 +23,19 @@ class TestDomainTrackingIntegration:
         return str(seed_file)
 
     @patch("crawler.spiders.discovery_spider.get_enable_domain_tracking")
+    @patch("crawler.spiders.discovery_spider.get_enable_smart_scheduling")
+    @patch("crawler.spiders.discovery_spider.get_enable_claim_protocol")
     @patch("crawler.spiders.discovery_spider.upsert_domain")
     @patch("crawler.spiders.discovery_spider.canonicalize_domain")
     def test_spider_upserts_domains_when_enabled(
-        self, mock_canonicalize, mock_upsert, mock_get_enabled, seed_file
+        self, mock_canonicalize, mock_upsert, mock_claim_protocol, mock_smart_scheduling, mock_get_enabled, seed_file
     ):
         """Test that spider upserts domains when tracking is enabled."""
         from crawler.spiders.discovery_spider import DiscoverySpider
 
         mock_get_enabled.return_value = True
+        mock_smart_scheduling.return_value = False  # Use file-based seeds, not DB claims
+        mock_claim_protocol.return_value = False  # Disable claim protocol
         mock_canonicalize.return_value = "example.com"
 
         spider = DiscoverySpider(seeds=seed_file)

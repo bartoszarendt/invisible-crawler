@@ -384,3 +384,141 @@ class TestExpireStaleClaims:
         count = expire_stale_claims()
 
         assert count == 0
+
+
+class TestForceReleaseClaims:
+    """Test force-release functionality (Workstream D)."""
+
+    def test_force_release_worker_claims(self, db_cursor):
+        """Should force-release all claims for a specific worker."""
+        from storage.domain_repository import force_release_worker_claims
+
+        # Setup: Insert claims for multiple workers
+        for i, worker in enumerate(["worker-1", "worker-1", "worker-2"]):
+            domain_id = uuid.uuid4()
+            db_cursor.execute(
+                """
+                INSERT INTO domains (id, domain, status, claimed_by, claim_expires_at)
+                VALUES (%s, %s, 'active', %s, CURRENT_TIMESTAMP + INTERVAL '20 minutes')
+                """,
+                (domain_id, f"domain{i}.com", worker),
+            )
+        db_cursor.commit()
+
+        # Force-release worker-1 claims
+        count = force_release_worker_claims("worker-1")
+
+        assert count == 2
+
+        # Verify worker-1 claims released
+        db_cursor.execute(
+            "SELECT COUNT(*) FROM domains WHERE claimed_by = 'worker-1'"
+        )
+        assert db_cursor.fetchone()[0] == 0
+
+        # Verify worker-2 claim still active
+        db_cursor.execute(
+            "SELECT COUNT(*) FROM domains WHERE claimed_by = 'worker-2'"
+        )
+        assert db_cursor.fetchone()[0] == 1
+
+    def test_force_release_all_claims(self, db_cursor):
+        """Should force-release all active claims (emergency recovery)."""
+        from storage.domain_repository import force_release_all_claims
+
+        # Setup: Insert claims for multiple workers
+        for i, worker in enumerate(["worker-1", "worker-2", "worker-3"]):
+            domain_id = uuid.uuid4()
+            db_cursor.execute(
+                """
+                INSERT INTO domains (id, domain, status, claimed_by, claim_expires_at)
+                VALUES (%s, %s, 'active', %s, CURRENT_TIMESTAMP + INTERVAL '20 minutes')
+                """,
+                (domain_id, f"domain{i}.com", worker),
+            )
+        db_cursor.commit()
+
+        # Force-release all claims
+        count = force_release_all_claims()
+
+        assert count == 3
+
+        # Verify all claims released
+        db_cursor.execute(
+            "SELECT COUNT(*) FROM domains WHERE claimed_by IS NOT NULL"
+        )
+        assert db_cursor.fetchone()[0] == 0
+
+    def test_incremental_stats_update(self, db_cursor):
+        """Should incrementally update stats for claimed domains (Workstream C)."""
+        from storage.domain_repository import increment_domain_stats_claimed
+
+        # Setup: Insert a claimed domain
+        domain_id = uuid.uuid4()
+        db_cursor.execute(
+            """
+            INSERT INTO domains (id, domain, status, claimed_by, claim_expires_at,
+                                pages_crawled, images_found, images_stored, total_error_count)
+            VALUES (%s, %s, 'active', 'worker-1', CURRENT_TIMESTAMP + INTERVAL '20 minutes',
+                    10, 5, 3, 0)
+            """,
+            (domain_id, "example.com"),
+        )
+        db_cursor.commit()
+
+        # Incrementally update stats (mid-crawl flush)
+        success = increment_domain_stats_claimed(
+            domain_id=domain_id,
+            worker_id="worker-1",  # Must match claim owner
+            pages_crawled_delta=15,
+            images_found_delta=8,
+            images_stored_delta=6,
+            total_error_count_delta=1,
+        )
+
+        assert success is True
+
+        # Verify stats incremented atomically
+        db_cursor.execute(
+            """
+            SELECT pages_crawled, images_found, images_stored, total_error_count
+            FROM domains WHERE id = %s
+            """,
+            (domain_id,),
+        )
+        row = db_cursor.fetchone()
+        assert row[0] == 25  # 10 + 15
+        assert row[1] == 13  # 5 + 8
+        assert row[2] == 9   # 3 + 6
+        assert row[3] == 1   # 0 + 1
+
+    def test_incremental_stats_requires_claim(self, db_cursor):
+        """Should fail incremental update if domain not claimed (safety check)."""
+        from storage.domain_repository import increment_domain_stats_claimed
+
+        # Setup: Insert an unclaimed domain
+        domain_id = uuid.uuid4()
+        db_cursor.execute(
+            """
+            INSERT INTO domains (id, domain, status, pages_crawled)
+            VALUES (%s, %s, 'pending', 0)
+            """,
+            (domain_id, "example.com"),
+        )
+        db_cursor.commit()
+
+        # Try to increment stats on unclaimed domain
+        success = increment_domain_stats_claimed(
+            domain_id=domain_id,
+            worker_id="worker-1",
+            pages_crawled_delta=10,
+        )
+
+        assert success is False  # Safety check: only update claimed domains
+
+        # Verify stats not updated
+        db_cursor.execute(
+            "SELECT pages_crawled FROM domains WHERE id = %s",
+            (domain_id,),
+        )
+        assert db_cursor.fetchone()[0] == 0

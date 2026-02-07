@@ -20,6 +20,7 @@ from env_config import (
     get_crawler_max_pages,
     get_default_max_pages_per_run,
     get_domain_canonicalization_strip_subdomains,
+    get_domain_stats_flush_interval,
     get_enable_claim_protocol,
     get_enable_domain_tracking,
     get_enable_per_domain_budget,
@@ -33,6 +34,8 @@ from storage.domain_repository import (
     claim_domains,
     clear_frontier_checkpoint,
     get_domain,
+    increment_crawl_run_stats,
+    increment_domain_stats_claimed,
     release_claim,
     renew_claim,
     update_domain_stats,
@@ -183,6 +186,28 @@ class DiscoverySpider(Spider):
         self._claimed_domains_lock = threading.Lock()
         self._heartbeat_thread: threading.Thread | None = None
         self._stop_heartbeat = threading.Event()
+        # Mid-crawl state flushing (Phase C resilience)
+        self.flush_interval = get_domain_stats_flush_interval()
+        self._domain_flushed_stats: dict[str, dict[str, int]] = {}  # Track flushed deltas
+
+        # Phase C validation: Claim protocol requires smart scheduling
+        if self.enable_claim_protocol and not self.enable_smart_scheduling:
+            raise ValueError(
+                "ENABLE_CLAIM_PROTOCOL=true requires ENABLE_SMART_SCHEDULING=true. "
+                "Claim protocol cannot operate without smart scheduling from domains table."
+            )
+
+        # Log effective scheduling mode for operator awareness
+        scheduler_mode = (
+            "local (per-worker queue isolation)"
+            if self.enable_smart_scheduling and self.enable_claim_protocol
+            else "Redis (shared queue across workers)"
+        )
+        self.logger.info(f"Scheduler mode: {scheduler_mode}")
+        if self.enable_smart_scheduling and self.enable_claim_protocol:
+            self.logger.info(
+                f"Phase C enabled: smart scheduling + claim protocol (worker: {self.worker_id})"
+            )
 
     def start_requests(self) -> Any:
         """Generate initial requests from seed domains.
@@ -562,6 +587,10 @@ class DiscoverySpider(Spider):
                     }
                 self._domain_stats[_tracking_canonical]["pages"] += 1
                 self._domain_stats[_tracking_canonical]["images_found"] += len(image_urls)
+
+                # Mid-crawl flush if enabled and threshold reached
+                if self.flush_interval > 0 and self.enable_domain_tracking:
+                    self._maybe_flush_domain_stats(_tracking_canonical)
             except Exception as e:
                 self.logger.debug(f"Failed to update domain stats for {current_domain}: {e}")
 
@@ -934,8 +963,10 @@ class DiscoverySpider(Spider):
         domain_images_stored = self._compute_domain_images_stored()
 
         # Phase C: Release all domain claims with stats update
+        # Track which domains were released to avoid double-counting in generic loop
+        released_domains: set[str] = set()
         if self.enable_claim_protocol and self._claimed_domains:
-            self._release_all_claims(domain_images_stored)
+            released_domains = self._release_all_claims(domain_images_stored)
 
         # Update crawl run if one was created
         if self.crawl_run_id:
@@ -1026,23 +1057,48 @@ class DiscoverySpider(Spider):
         # Domain tracking: update domain stats for all crawled domains
         if self.enable_domain_tracking and self._domain_stats:
             try:
-                self.logger.info(f"Updating domain stats for {len(self._domain_stats)} domains...")
-                for domain, stats in self._domain_stats.items():
+                # Filter out domains already updated via claim release to prevent double-counting
+                domains_to_update = {
+                    d: s for d, s in self._domain_stats.items() if d not in released_domains
+                }
+                self.logger.info(
+                    f"Updating domain stats for {len(domains_to_update)} domains "
+                    f"({len(released_domains)} already updated via claim release)..."
+                )
+                for domain, stats in domains_to_update.items():
+                    # Get flushed stats to compute remainders
+                    flushed = self._domain_flushed_stats.get(
+                        domain,
+                        {"pages": 0, "images_found": 0, "errors": 0, "links_discovered": 0}
+                    )
+
+                    # Compute remainder deltas (avoid double-counting after mid-crawl flush)
+                    pages_delta = max(0, stats.get("pages", 0) - flushed.get("pages", 0))
+                    images_delta = max(0, stats.get("images_found", 0) - flushed.get("images_found", 0))
+                    errors_delta = max(0, stats.get("errors", 0) - flushed.get("errors", 0))
+                    links_delta = max(0, stats.get("links_discovered", 0) - flushed.get("links_discovered", 0))
+
                     # Determine status based on crawl outcome using canonicalized blocked set
                     if domain in self._blocked_domains_canonical:
                         status = "blocked"
+                    elif stats["pages"] == 0 and stats.get("errors", 0) > 0:
+                        # Never successfully crawled, only errors (DNS, timeout, etc.)
+                        status = "unreachable"
+                    elif stats["pages"] == 0:
+                        # Never reached at all — keep as pending
+                        status = "pending"
                     else:
-                        status = "active"  # Simple for Phase A
+                        status = "active"
 
                     update_domain_stats(
                         domain=domain,
-                        pages_crawled_delta=stats["pages"],
-                        pages_discovered_delta=stats["pages"] + stats.get("links_discovered", 0),
-                        images_found_delta=stats["images_found"],
+                        pages_crawled_delta=pages_delta,
+                        pages_discovered_delta=pages_delta + links_delta,
+                        images_found_delta=images_delta,
                         images_stored_delta=domain_images_stored.get(domain, 0),
-                        total_error_count_delta=stats.get("errors", 0),
+                        total_error_count_delta=errors_delta,
                         consecutive_error_count=(
-                            0 if stats["pages"] > 0 else stats.get("errors", 0)
+                            0 if pages_delta > 0 else errors_delta
                         ),
                         status=status,
                         last_crawl_run_id=str(self.crawl_run_id) if self.crawl_run_id else None,
@@ -1095,7 +1151,7 @@ class DiscoverySpider(Spider):
             self.logger.warning(f"Failed to query images_stored per domain: {e}")
         return result
 
-    def _release_all_claims(self, domain_images_stored: dict[str, int]) -> None:
+    def _release_all_claims(self, domain_images_stored: dict[str, int]) -> set[str]:
         """Phase C: Release all claimed domains with optimistic locking.
 
         Atomically releases each domain claim and updates stats.
@@ -1104,7 +1160,13 @@ class DiscoverySpider(Spider):
         Args:
             domain_images_stored: Dict mapping canonical domain to images_stored count,
                 computed from crawl_log for the current run.
+
+        Returns:
+            Set of canonical domain names that were successfully released.
         """
+        # Track successfully released domains to prevent double-counting
+        released_domains: set[str] = set()
+
         with self._claimed_domains_lock:
             claimed_snapshot = list(self._claimed_domains.items())
 
@@ -1120,10 +1182,17 @@ class DiscoverySpider(Spider):
                 canonical_domain,
                 {"pages": 0, "images_found": 0, "errors": 0, "links_discovered": 0},
             )
-            pages_crawled = stats.get("pages", 0)
-            images_found = stats.get("images_found", 0)
+            flushed = self._domain_flushed_stats.get(
+                canonical_domain,
+                {"pages": 0, "images_found": 0, "images_stored": 0, "errors": 0},
+            )
+
+            # Compute deltas since last flush (avoid double-counting)
+            pages_crawled = max(0, stats.get("pages", 0) - flushed.get("pages", 0))
+            images_found = max(0, stats.get("images_found", 0) - flushed.get("images_found", 0))
             images_stored = domain_images_stored.get(canonical_domain, 0)
-            errors = stats.get("errors", 0)
+            errors = max(0, stats.get("errors", 0) - flushed.get("errors", 0))
+            links_discovered = max(0, stats.get("links_discovered", 0) - flushed.get("links_discovered", 0))
 
             # Determine final status — check both canonical and raw keys for pending URLs
             if canonical_domain in self._blocked_domains_canonical:
@@ -1164,7 +1233,7 @@ class DiscoverySpider(Spider):
                 try:
                     updates: dict[str, Any] = {
                         "pages_crawled_delta": pages_crawled,
-                        "pages_discovered_delta": pages_crawled + stats.get("links_discovered", 0),
+                        "pages_discovered_delta": pages_crawled + links_discovered,  # Use remainder links
                         "images_found_delta": images_found,
                         "images_stored_delta": images_stored,
                         "total_error_count_delta": errors,
@@ -1187,6 +1256,7 @@ class DiscoverySpider(Spider):
 
                     if success:
                         released = True
+                        released_domains.add(canonical_domain)
                         self.logger.debug(f"Released claim for {domain} (status: {status})")
                         break
                     else:
@@ -1206,7 +1276,92 @@ class DiscoverySpider(Spider):
             if not released:
                 self.logger.error(f"Could not release claim for {domain} after 3 attempts")
 
-        self.logger.info("Domain claim release complete")
+        self.logger.info(
+            f"Domain claim release complete: {len(released_domains)}/{len(claimed_snapshot)} succeeded"
+        )
+        return released_domains
+
+    def _maybe_flush_domain_stats(self, canonical_domain: str) -> None:
+        """Flush domain stats to DB if threshold reached (mid-crawl persistence).
+
+        Args:
+            canonical_domain: Canonical domain name.
+        """
+        stats = self._domain_stats.get(canonical_domain, {})
+        flushed = self._domain_flushed_stats.get(
+            canonical_domain, {"pages": 0, "images_found": 0, "images_stored": 0, "errors": 0}
+        )
+
+        unflushed_pages = stats.get("pages", 0) - flushed["pages"]
+
+        if unflushed_pages < self.flush_interval:
+            return  # Below threshold
+
+        # Compute deltas since last flush
+        pages_delta = stats.get("pages", 0) - flushed["pages"]
+        images_delta = stats.get("images_found", 0) - flushed["images_found"]
+        errors_delta = stats.get("errors", 0) - flushed.get("errors", 0)
+        links_delta = stats.get("links_discovered", 0) - flushed.get("links_discovered", 0)
+
+        try:
+            # Phase C: Use claim-safe incremental update
+            if self.enable_claim_protocol:
+                # Find domain_id from claimed domains
+                domain_id = None
+                with self._claimed_domains_lock:
+                    for did, info in self._claimed_domains.items():
+                        if canonicalize_domain(info["domain"], self.strip_subdomains) == canonical_domain:
+                            domain_id = did
+                            break
+
+                if domain_id:
+                    success = increment_domain_stats_claimed(
+                        domain_id=domain_id,
+                        worker_id=self.worker_id,
+                        pages_crawled_delta=pages_delta,
+                        images_found_delta=images_delta,
+                        total_error_count_delta=errors_delta,
+                        crawl_run_id=self.crawl_run_id,
+                    )
+                    if not success:
+                        self.logger.warning(
+                            f"Failed to increment stats for {canonical_domain}: claim may be lost"
+                        )
+                        return
+            else:
+                # Phase A/B: Use standard update (non-claimed domains)
+                update_domain_stats(
+                    domain=canonical_domain,
+                    pages_crawled_delta=pages_delta,
+                    pages_discovered_delta=pages_delta + links_delta,
+                    images_found_delta=images_delta,
+                    images_stored_delta=0,  # Computed from crawl_log at close
+                    total_error_count_delta=errors_delta,
+                    consecutive_error_count=0,
+                    status="active",
+                    last_crawl_run_id=str(self.crawl_run_id) if self.crawl_run_id else None,
+                )
+
+            # Update flushed counters (tracking cumulative flush progress)
+            self._domain_flushed_stats[canonical_domain] = {
+                "pages": stats.get("pages", 0),
+                "images_found": stats.get("images_found", 0),
+                "images_stored": 0,  # Not tracked during parse
+                "errors": stats.get("errors", 0),
+                "links_discovered": stats.get("links_discovered", 0),
+            }
+
+            # Increment run counters incrementally
+            if self.crawl_run_id:
+                increment_crawl_run_stats(self.crawl_run_id, pages_delta, images_delta)
+
+            self.logger.debug(
+                f"Flushed stats for {canonical_domain}: "
+                f"+{pages_delta} pages, +{images_delta} images"
+            )
+
+        except Exception as e:
+            self.logger.warning(f"Failed to flush stats for {canonical_domain}: {e}")
 
     def _log_crawl_entry(
         self,

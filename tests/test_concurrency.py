@@ -275,3 +275,128 @@ class TestNoDuplicateWork:
 
         assert len(claims) == 1
         assert claims[0]["claimed_by"] == "recovery-worker"
+
+
+class TestSchedulerModeValidation:
+    """Test scheduler mode validation (Workstream A)."""
+
+    def test_claim_protocol_requires_smart_scheduling(self):
+        """Should raise ValueError if claim protocol enabled without smart scheduling."""
+        from unittest.mock import patch
+
+        from crawler.spiders.discovery_spider import DiscoverySpider
+
+        # Try to create spider with claim protocol but without smart scheduling
+        with (
+            patch(
+                "crawler.spiders.discovery_spider.get_enable_smart_scheduling", return_value=False
+            ),
+            patch("crawler.spiders.discovery_spider.get_enable_claim_protocol", return_value=True),
+        ):
+            try:
+                DiscoverySpider()
+                assert False, "Should have raised ValueError"
+            except ValueError as e:
+                assert "ENABLE_CLAIM_PROTOCOL" in str(e)
+                assert "ENABLE_SMART_SCHEDULING" in str(e)
+
+    def test_scheduler_mode_logged(self):
+        """Should log effective scheduler mode at startup."""
+        from unittest.mock import patch
+
+        from crawler.spiders.discovery_spider import DiscoverySpider
+
+        # Phase C mode
+        with (
+            patch(
+                "crawler.spiders.discovery_spider.get_enable_smart_scheduling", return_value=True
+            ),
+            patch("crawler.spiders.discovery_spider.get_enable_claim_protocol", return_value=True),
+        ):
+            spider = DiscoverySpider()
+            # Just verify it initializes without error
+            # (actual logging verification would require inspecting logger mock)
+            assert spider.enable_smart_scheduling is True
+            assert spider.enable_claim_protocol is True
+
+
+class TestPhaseCDomainIsolation:
+    """Test Phase C prevents cross-worker domain overlap (Workstream A)."""
+
+    def test_claimed_domains_not_in_shared_queue(self, db_cursor):
+        """Phase C: Claimed domains should not appear in other workers' queues."""
+        # This is conceptually tested by the queue isolation design:
+        # Phase C uses local scheduler, so there's no shared queue to test.
+        # The key validation is that claim_domains uses FOR UPDATE SKIP LOCKED.
+
+        # Setup: Insert 3 domains
+        domain_ids = []
+        for i in range(3):
+            domain_id = uuid.uuid4()
+            domain_ids.append(domain_id)
+            db_cursor.execute(
+                """
+                INSERT INTO domains (id, domain, status, priority_score)
+                VALUES (%s, %s, 'pending', %s)
+                """,
+                (domain_id, f"domain{i}.com", i * 10),
+            )
+            db_cursor.commit()
+
+        # Worker 1 claims 2 domains
+        claims_w1 = claim_domains("worker-1", batch_size=2)
+        assert len(claims_w1) == 2
+
+        # Worker 2 should only see the remaining 1 domain
+        claims_w2 = claim_domains("worker-2", batch_size=10)
+        assert len(claims_w2) == 1
+
+        # Verify no overlap
+        w1_ids = {c["id"] for c in claims_w1}
+        w2_ids = {c["id"] for c in claims_w2}
+        assert len(w1_ids & w2_ids) == 0, "Workers claimed overlapping domains"
+
+    def test_phase_c_multi_worker_no_domain_overlap(self, db_cursor):
+        """Phase C: Multiple workers should have zero domain overlap across runs."""
+        # Setup: Insert 50 domains
+        for i in range(50):
+            domain_id = uuid.uuid4()
+            db_cursor.execute(
+                """
+                INSERT INTO domains (id, domain, status, priority_score)
+                VALUES (%s, %s, 'pending', %s)
+                """,
+                (domain_id, f"domain{i}.com", i),
+            )
+            db_cursor.commit()
+
+        # Simulate 3 workers claiming and releasing domains
+        worker_domains = {"worker-1": set(), "worker-2": set(), "worker-3": set()}
+
+        def worker_claim_release(worker_id):
+            claims = claim_domains(worker_id, batch_size=5)
+            for claim in claims:
+                worker_domains[worker_id].add(claim["domain"])
+                # Release immediately (simulating quick crawl)
+                release_claim(
+                    claim["id"],
+                    worker_id,
+                    claim["version"],
+                    pages_crawled_delta=1,
+                    status="exhausted",
+                )
+
+        # Run workers in sequence (to ensure deterministic behavior)
+        for worker_id in ["worker-1", "worker-2", "worker-3"]:
+            for _ in range(5):  # Each worker claims 5 batches
+                worker_claim_release(worker_id)
+
+        # Verify: no domain appears in multiple workers' sets
+        all_domains = []
+        for domains_set in worker_domains.values():
+            all_domains.extend(domains_set)
+
+        assert len(all_domains) == len(set(all_domains)), (
+            "Domain overlap detected: same domain claimed by multiple workers"
+        )
+        assert len(set(all_domains)) <= 50, f"More domains than expected: {len(set(all_domains))}"

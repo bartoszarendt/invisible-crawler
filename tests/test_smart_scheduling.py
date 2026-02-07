@@ -196,3 +196,66 @@ class TestClaimRelease:
             spider.closed("finished")
 
         assert mock_release.call_count == 3
+
+    def test_no_double_count_on_close(self, spider):
+        """Should not double-count stats when claim protocol enabled (Workstream B)."""
+        # Setup: Multi-domain scenario with both claimed and non-claimed domains
+        domain_id_1 = str(uuid.uuid4())
+        str(uuid.uuid4())
+
+        spider._claimed_domains = {
+            domain_id_1: {"domain": "claimed.com", "version": 1}
+        }
+        spider._domain_stats = {
+            "claimed.com": {"pages": 10, "images_found": 5, "errors": 0, "links_discovered": 3},
+            "unclaimed.com": {"pages": 8, "images_found": 2, "errors": 1, "links_discovered": 4},
+        }
+        spider._compute_domain_images_stored = MagicMock(
+            return_value={"claimed.com": 3, "unclaimed.com": 1}
+        )
+
+        with (
+            patch(
+                "crawler.spiders.discovery_spider.release_claim",
+                return_value=True,
+            ),
+            patch(
+                "crawler.spiders.discovery_spider.update_domain_stats"
+            ) as mock_update_stats,
+        ):
+            spider.closed("finished")
+
+        # Verify: release_claim was called for claimed domain
+        # Verify: update_domain_stats was called ONLY for unclaimed domain (not double-counted)
+        assert mock_update_stats.call_count == 1
+        call_args = mock_update_stats.call_args
+        assert call_args.kwargs["domain"] == "unclaimed.com"
+        assert call_args.kwargs["pages_crawled_delta"] == 8
+
+    def test_exhausted_status_preserved(self, spider):
+        """Should preserve terminal status from release_claim (Workstream B)."""
+        domain_id = str(uuid.uuid4())
+        spider._claimed_domains = {domain_id: {"domain": "example.com", "version": 1}}
+        spider._domain_stats = {
+            "example.com": {"pages": 100, "images_found": 50, "errors": 0, "links_discovered": 0}
+        }
+        spider._domain_pending_urls = {}  # No pending URLs = exhausted
+        spider._compute_domain_images_stored = MagicMock(return_value={"example.com": 40})
+
+        with (
+            patch(
+                "crawler.spiders.discovery_spider.release_claim",
+                return_value=True,
+            ) as mock_release,
+            patch(
+                "crawler.spiders.discovery_spider.update_domain_stats"
+            ) as mock_update_stats,
+        ):
+            spider.closed("finished")
+
+        # Verify: release_claim was called with status='exhausted'
+        call_args = mock_release.call_args
+        assert call_args.kwargs["status"] == "exhausted"
+
+        # Verify: update_domain_stats was NOT called for this domain (no overwrite)
+        assert mock_update_stats.call_count == 0

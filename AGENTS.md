@@ -5,13 +5,13 @@ InvisibleCrawler is a self-hosted, large-scale web crawler designed to discover 
 ## Repository Structure
 
 * **SYSTEM_DESIGN.md** – architectural blueprint covering goals, design principles, data flow, and evolution path
-* **IMPLEMENTATION.md** – Phase 1 implementation details, runbook, and Phase 2 roadmap
-* **DOMAIN_TRACKING_DESIGN.md** – design proposal for domain-centric crawl tracking (pending review)
+* **IMPLEMENTATION.md** – implementation status, runbook, and rollout guidance for Phase 2 + domain tracking (Phases A-C)
+* **DOMAIN_TRACKING_DESIGN.md** – design and migration reference for domain-centric crawl tracking
 * **crawler/** – Scrapy-based crawling engine with spiders and pipelines
 * **processor/** – image fetching, normalization, and fingerprinting logic
 * **storage/** – database schemas and Alembic migrations for PostgreSQL
 * **config/** – seed domain lists, allowlists, and blocklists
-* **tests/** – unit and integration test suites (32 tests)
+* **tests/** – unit and integration test suites (225 collected tests; DB-backed tests require `DATABASE_URL`)
 
 ## Build & Development Commands
 
@@ -95,7 +95,7 @@ The crawler follows a pipeline architecture with clear stage boundaries:
 
 * **Unit tests**: pytest for individual components (fetcher, fingerprinter, spider parsing)
 * **Integration tests**: pytest-httpserver for mock HTTP endpoints; requires running PostgreSQL
-* **Test count**: 32 tests covering processor, spider, and pipeline integration
+* **Test count**: 225 collected tests; DB-backed domain-tracking tests require `DATABASE_URL`
 * **Fixtures**: Synthetic HTML pages in `tests/fixtures.py`
 * **Coverage target**: ≥80% for core logic
 
@@ -190,20 +190,27 @@ When structural gaps are identified, agents should:
 * **Seed providers**: Dynamic seed generation from external APIs
 * **Post-processing pipelines**: Hook for adding custom analyzers without forking
 
-**Environment Variables (Phase 1):**
+**Environment Variables (Current):**
 
 * `DATABASE_URL`: PostgreSQL connection string
+* `REDIS_URL`: Redis connection string
 * `CRAWLER_USER_AGENT`: User-Agent string for image fetching
 * `DISCOVERY_REFRESH_AFTER_DAYS`: Re-fetch images older than N days (default: 0 = disabled)
+* `ENABLE_DOMAIN_TRACKING`: Enable persistent domain tracking (Phase A)
+* `DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS`: Collapse to registrable domain when enabled
+* `ENABLE_PER_DOMAIN_BUDGET`: Enable per-domain crawl budgets + checkpointing (Phase B)
+* `MAX_PAGES_PER_RUN`: Per-domain page budget when Phase B is enabled
+* `ENABLE_SMART_SCHEDULING`: Enable DB-driven candidate selection (Phase C)
+* `ENABLE_CLAIM_PROTOCOL`: Enable claim/lease concurrency protocol (Phase C)
 
 ## Further Reading
 
-* **IMPLEMENTATION.md** – Phase 1 details, local runbook, and Phase 2 roadmap
+* **IMPLEMENTATION.md** – current implementation status and runbook
 * **SYSTEM_DESIGN.md** – architectural blueprint and design principles
-* **DOMAIN_TRACKING_DESIGN.md** – proposal for persistent domain state, smart scheduling, and resume support
+* **DOMAIN_TRACKING_DESIGN.md** – domain tracking design and phased migration reference
 
 ---
 
-**Last Updated**: 2026-02-06  
-**Status**: Phase 2 (Redis scheduling); domain tracking proposal under review  
+**Last Updated**: 2026-02-07  
+**Status**: Phase 2 + Domain Tracking Phases A-C implemented; Phase D (refresh mode) pending  
 **Maintainer Contact**: TBD

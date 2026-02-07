@@ -178,6 +178,9 @@ def downgrade() -> None:
     op.execute("DROP TRIGGER IF EXISTS domains_updated_at_trigger ON domains;")
     op.execute("DROP FUNCTION IF EXISTS update_domains_updated_at();")
 
+    # Drop the transition function if it exists (added in later migration, but may be present)
+    op.execute("DROP FUNCTION IF EXISTS transition_domain_status(UUID, domain_status, domain_status, VARCHAR, INTEGER);")
+
     # Drop indexes
     op.execute("DROP INDEX IF EXISTS idx_domains_claims;")
     op.execute("DROP INDEX IF EXISTS idx_domains_refresh_candidates;")

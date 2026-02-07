@@ -501,35 +501,209 @@ def release_stuck_claims_command(args: argparse.Namespace) -> int:
         Exit code (0 for success, 1 for failure).
     """
     dry_run = args.dry_run
+    force = args.force
+    worker_id = args.worker_id
+    all_active = args.all_active
 
     try:
-        from storage.domain_repository import expire_stale_claims, get_active_claims
+        from storage.domain_repository import (
+            expire_stale_claims,
+            force_release_all_claims,
+            force_release_worker_claims,
+            get_active_claims,
+            preview_claims_by_worker,
+        )
+
+        # Validation: --all-active requires --force
+        if all_active and not force:
+            print("Error: --all-active requires --force flag for safety")
+            return 1
+
+        # Validation: --worker-id requires --force
+        if worker_id and not force:
+            print("Error: --worker-id requires --force flag for safety")
+            return 1
 
         # Show current active claims
         active_claims = get_active_claims()
         if active_claims:
             print("\nActive claims before cleanup:")
             for claim in active_claims:
-                print(f"  {claim['worker_id']}: {claim['count']} domains")
+                print(
+                    f"  {claim['worker_id']}: {claim['count']} domains "
+                    f"(expires: {claim['earliest_expiry']} - {claim['latest_expiry']})"
+                )
+        else:
+            print("\nNo active claims found")
 
-        if dry_run:
-            print("\nDRY RUN: Would release expired claims")
+        # Default behavior: release expired claims only (backward compatible)
+        if not force:
+            if dry_run:
+                print("\nDRY RUN: Would release expired claims")
+                return 0
+
+            count = expire_stale_claims()
+            print(f"\nReleased {count} expired claims")
+
+            # Show remaining active claims
+            active_claims = get_active_claims()
+            if active_claims:
+                print("\nRemaining active claims:")
+                for claim in active_claims:
+                    print(f"  {claim['worker_id']}: {claim['count']} domains")
+
             return 0
 
-        count = expire_stale_claims()
-        print(f"\nReleased {count} stuck/expired claims")
+        # Force-release logic
+        if worker_id:
+            # Targeted: release specific worker's claims
+            domains = preview_claims_by_worker(worker_id)
+            if not domains:
+                print(f"\nNo active claims found for worker: {worker_id}")
+                return 0
 
-        # Show remaining active claims
+            print(f"\nWould release {len(domains)} claims for worker: {worker_id}")
+            print("Sample domains:")
+            for d in domains[:5]:
+                print(f"  {d['domain']} (status: {d['status']})")
+            if len(domains) > 5:
+                print(f"  ... and {len(domains) - 5} more")
+
+            if dry_run:
+                print("\nDRY RUN: No changes made")
+                return 0
+
+            if not _confirm("Proceed with force-release?"):
+                print("Aborted")
+                return 1
+
+            count = force_release_worker_claims(worker_id)
+            print(f"\nForce-released {count} claims for worker: {worker_id}")
+
+        elif all_active:
+            # Global: release all active claims
+            total_count = sum(c['count'] for c in active_claims)
+            print(f"\nWould release {total_count} active claims across all workers")
+            print("\nWARNING: This will release ALL active claims, including from running workers!")
+
+            if dry_run:
+                print("\nDRY RUN: No changes made")
+                return 0
+
+            if not _confirm("Proceed with global force-release?"):
+                print("Aborted")
+                return 1
+
+            count = force_release_all_claims()
+            print(f"\nForce-released {count} claims globally")
+
+        # Show final state
         active_claims = get_active_claims()
         if active_claims:
             print("\nRemaining active claims:")
             for claim in active_claims:
                 print(f"  {claim['worker_id']}: {claim['count']} domains")
+        else:
+            print("\nNo active claims remaining")
 
         return 0
 
     except Exception as e:
         logger.error(f"Failed to release stuck claims: {e}")
+        return 1
+
+
+def _confirm(message: str) -> bool:
+    """Prompt user for confirmation.
+
+    Args:
+        message: Confirmation message.
+
+    Returns:
+        True if user confirms, False otherwise.
+    """
+    response = input(f"{message} [y/N]: ").strip().lower()
+    return response in ("y", "yes")
+
+
+def cleanup_stale_runs_command(args: argparse.Namespace) -> int:
+    """Mark stale crawl_runs as failed.
+
+    Identifies runs with no recent activity and marks them as failed
+    to clean up operational state.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
+    older_than_minutes = args.older_than_minutes
+    dry_run = args.dry_run
+
+    try:
+        from storage.db import get_cursor
+
+        with get_cursor() as cur:
+            # Find stale runs: no recent activity and still 'running'
+            cur.execute(
+                """
+                WITH run_activity AS (
+                    SELECT cr.id, cr.started_at, cr.status,
+                           COALESCE(MAX(cl.crawled_at), cr.started_at) AS last_activity
+                    FROM crawl_runs cr
+                    LEFT JOIN crawl_log cl ON cl.crawl_run_id = cr.id
+                    WHERE cr.status = 'running'
+                    GROUP BY cr.id, cr.started_at, cr.status
+                )
+                SELECT id, started_at, last_activity,
+                       EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_activity))/60 AS minutes_idle
+                FROM run_activity
+                WHERE last_activity < CURRENT_TIMESTAMP - INTERVAL '%s minutes'
+                ORDER BY last_activity ASC
+                """,
+                (older_than_minutes,),
+            )
+
+            stale_runs = cur.fetchall()
+
+            if not stale_runs:
+                print(f"\\nNo stale runs found (threshold: {older_than_minutes} minutes)")
+                return 0
+
+            print(f"\\nFound {len(stale_runs)} stale runs:")
+            for run_id, started, last_activity, minutes_idle in stale_runs:
+                print(
+                    f"  Run {run_id}: started {started}, "
+                    f"last activity {last_activity} ({int(minutes_idle)} min ago)"
+                )
+
+            if dry_run:
+                print("\\nDRY RUN: No changes made")
+                return 0
+
+            if not _confirm("Mark these runs as failed?"):
+                print("Aborted")
+                return 0
+
+            # Mark as failed
+            run_ids = [r[0] for r in stale_runs]
+            cur.execute(
+                """
+                UPDATE crawl_runs
+                SET status = 'failed',
+                    completed_at = CURRENT_TIMESTAMP,
+                    error_message = 'Marked stale: no activity timeout'
+                WHERE id = ANY(%s)
+                """,
+                (run_ids,),
+            )
+
+            print(f"\\nMarked {cur.rowcount} runs as failed")
+            return 0
+
+    except Exception as e:
+        logger.error(f"Failed to cleanup stale runs: {e}")
         return 1
 
 
@@ -745,7 +919,39 @@ def main() -> int:
         action="store_true",
         help="Show what would be done without making changes",
     )
+    release_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force-release active (non-expired) claims",
+    )
+    release_parser.add_argument(
+        "--worker-id",
+        help="Release claims for specific worker only (requires --force)",
+    )
+    release_parser.add_argument(
+        "--all-active",
+        action="store_true",
+        help="Release all active claims across all workers (requires --force)",
+    )
     release_parser.set_defaults(func=release_stuck_claims_command)
+
+    # cleanup-stale-runs command
+    stale_runs_parser = subparsers.add_parser(
+        "cleanup-stale-runs",
+        help="Mark stale crawl_runs as failed (no recent activity)",
+    )
+    stale_runs_parser.add_argument(
+        "--older-than-minutes",
+        type=int,
+        default=60,
+        help="Mark runs stale after N minutes of inactivity (default: 60)",
+    )
+    stale_runs_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview without marking as failed",
+    )
+    stale_runs_parser.set_defaults(func=cleanup_stale_runs_command)
 
     # domain-reset command
     reset_parser = subparsers.add_parser(

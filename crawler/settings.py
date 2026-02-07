@@ -9,6 +9,8 @@ from pathlib import Path
 from crawler.redis_keys import dupefilter_key_pattern, requests_key_pattern
 from env_config import (
     get_crawler_user_agent,
+    get_enable_claim_protocol,
+    get_enable_smart_scheduling,
     get_log_level,
     get_redis_url,
     get_scrapy_autothrottle_enabled,
@@ -117,23 +119,38 @@ SEEDS_DIR = PROJECT_ROOT / "config"
 # Redis URL Frontier Configuration (Phase 2)
 # ============================================================================
 
-# Enable Redis scheduler for distributed crawling
-# IMPORTANT: Redis is required when this scheduler is enabled
-# Use check_redis_available() to verify Redis connectivity before starting crawls
-SCHEDULER = "crawler.scheduler.InvisibleRedisScheduler"
+# Scheduler selection: Phase C (smart scheduling + claim protocol) uses local
+# scheduler for per-worker queue isolation. Phases A/B use Redis scheduler
+# for shared queue across workers.
+_is_phase_c = get_enable_smart_scheduling() and get_enable_claim_protocol()
 
-# Scheduler settings
+# Enable Redis scheduler for distributed crawling (Phases A/B)
+# Phase C uses local scheduler to prevent cross-worker domain overlap
+# IMPORTANT: Redis is required when Redis scheduler is enabled
+# Use check_redis_available() to verify Redis connectivity before starting crawls
+SCHEDULER = (
+    "scrapy.core.scheduler.Scheduler"  # Local scheduler (Phase C)
+    if _is_phase_c
+    else "scrapy_redis.scheduler.Scheduler"  # Redis scheduler (Phases A/B)
+)
+
+# DupeFilter for URL deduplication
+# Note: Phase C uses local dupefilter; Phase A/B uses Redis dupefilter
+DUPEFILTER_CLASS = (
+    "scrapy.dupefilters.RFPDupeFilter"  # Local dupefilter (Phase C)
+    if _is_phase_c
+    else "scrapy_redis.dupefilter.RFPDupeFilter"  # Redis dupefilter (Phases A/B)
+)
+
+# Queue class - supports priority and per-domain tracking
+# Note: Only used by Redis scheduler (Phases A/B); ignored by local scheduler (Phase C)
+SCHEDULER_QUEUE_CLASS = "crawler.scheduler.DomainPriorityQueue"
+SCHEDULER_QUEUE_KEY = requests_key_pattern()
+DUPEFILTER_KEY = dupefilter_key_pattern()
+
 SCHEDULER_PERSIST = True  # Persist queues on spider close
 SCHEDULER_FLUSH_ON_START = False  # Don't flush queues on start (enables resume)
 SCHEDULER_IDLE_BEFORE_CLOSE = 0  # Close immediately when queue empty
-
-# Queue class - supports priority and per-domain tracking
-SCHEDULER_QUEUE_CLASS = "crawler.scheduler.DomainPriorityQueue"
-SCHEDULER_QUEUE_KEY = requests_key_pattern()
-
-# DupeFilter for URL deduplication
-DUPEFILTER_CLASS = "scrapy_redis.dupefilter.RFPDupeFilter"
-DUPEFILTER_KEY = dupefilter_key_pattern()
 
 # Redis connection (from REDIS_URL env var)
 REDIS_URL = get_redis_url()

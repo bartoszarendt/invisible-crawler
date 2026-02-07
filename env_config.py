@@ -46,7 +46,7 @@ BROAD_SCRAPY_DOWNLOAD_DELAY = 0.25
 BROAD_SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY = 4.0
 BROAD_SCRAPY_DOWNLOAD_TIMEOUT = 20
 BROAD_SCRAPY_RETRY_TIMES = 2
-DEFAULT_CRAWLER_MAX_PAGES = 10
+DEFAULT_CRAWLER_MAX_PAGES = 100000  # Global safety ceiling; per-domain budget is the primary control
 ALLOWED_APP_ENVS = {"dev", "staging", "prod"}
 
 # Domain tracking feature flags (Phase A)
@@ -54,12 +54,13 @@ DEFAULT_ENABLE_DOMAIN_TRACKING = True
 DEFAULT_DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS = False
 
 # Per-domain budget feature flags (Phase B)
-DEFAULT_ENABLE_PER_DOMAIN_BUDGET = False
-DEFAULT_MAX_PAGES_PER_RUN = 1000
+DEFAULT_ENABLE_PER_DOMAIN_BUDGET = True
+DEFAULT_MAX_PAGES_PER_RUN = 100
 
 # Smart scheduling feature flags (Phase C)
 DEFAULT_ENABLE_SMART_SCHEDULING = False
 DEFAULT_ENABLE_CLAIM_PROTOCOL = False
+DEFAULT_DOMAIN_STATS_FLUSH_INTERVAL_PAGES = 100  # 0 = disabled
 
 ALLOWED_CRAWL_PROFILES = {"conservative", "broad"}
 
@@ -341,3 +342,17 @@ def get_enable_claim_protocol() -> bool:
     Must be enabled together with ENABLE_SMART_SCHEDULING for Phase C.
     """
     return get_bool_env("ENABLE_CLAIM_PROTOCOL", DEFAULT_ENABLE_CLAIM_PROTOCOL)
+
+
+def get_domain_stats_flush_interval() -> int:
+    """Get periodic domain stats flush interval in pages (0 = disabled).
+
+    When enabled, domain stats are incrementally persisted to the database
+    every N pages to survive force-kill without losing all progress.
+
+    Returns:
+        Number of pages between flushes, or 0 to disable mid-crawl flushing.
+
+    Default: 100 pages (about 1 flush per minute per domain at 2 pages/sec)
+    """
+    return get_int_env("DOMAIN_STATS_FLUSH_INTERVAL_PAGES", DEFAULT_DOMAIN_STATS_FLUSH_INTERVAL_PAGES)
