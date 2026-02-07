@@ -9,6 +9,7 @@ from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.extensions import connection
+from psycopg2.extensions import cursor as psycopg_cursor
 from psycopg2.pool import ThreadedConnectionPool
 
 from env_config import get_database_url
@@ -68,7 +69,7 @@ def get_connection() -> Generator[connection, None, None]:
 
 
 @contextmanager
-def get_cursor() -> Generator:
+def get_cursor() -> Generator[psycopg_cursor, None, None]:
     """Get a database cursor with automatic connection management.
 
     Yields:

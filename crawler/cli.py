@@ -10,7 +10,9 @@ import argparse
 import csv
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -28,6 +30,13 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _redis_from_url(redis_url: str) -> Any:
+    import redis
+
+    redis_module = cast(Any, redis)
+    return redis_module.from_url(redis_url)
 
 
 def ingest_seeds_command(args: argparse.Namespace) -> int:
@@ -53,6 +62,7 @@ def ingest_seeds_command(args: argparse.Namespace) -> int:
         return 1
 
     # Determine source file path
+    source_file: Path | None
     if source == "tranco":
         source_file = Path("config/tranco_top1m.csv")
     elif source == "majestic":
@@ -111,8 +121,6 @@ def ingest_from_csv(
     Returns:
         Dictionary with ingestion statistics.
     """
-    import redis
-
     stats = {
         "rows_read": 0,
         "seeds_ingested": 0,
@@ -120,7 +128,7 @@ def ingest_from_csv(
         "errors": 0,
     }
 
-    client = redis.from_url(redis_url)
+    client = _redis_from_url(redis_url)
     queue_key = start_urls_key("discovery")
     seen_key = seen_domains_key("discovery")
 
@@ -252,9 +260,7 @@ def queue_status_command(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        import redis
-
-        client = redis.from_url(redis_url)
+        client = _redis_from_url(redis_url)
 
         # Get queue info
         start_urls_redis_key = start_urls_key("discovery")
@@ -975,7 +981,8 @@ def main() -> int:
         parser.print_help()
         return 1
 
-    return args.func(args)
+    handler = cast(Callable[[argparse.Namespace], int], args.func)
+    return handler(args)
 
 
 if __name__ == "__main__":

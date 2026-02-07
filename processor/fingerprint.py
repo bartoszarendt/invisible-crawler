@@ -66,10 +66,9 @@ class ImageFingerprinter:
         try:
             img = Image.open(BytesIO(content))
             # Convert to RGB if necessary
-            if img.mode != "RGB":
-                img = img.convert("RGB")
+            img_rgb = img.convert("RGB") if img.mode != "RGB" else img
 
-            phash = imagehash.phash(img, hash_size=self.hash_size)
+            phash = imagehash.phash(img_rgb, hash_size=self.hash_size)
             return str(phash)
         except Exception as e:
             logger.debug(f"Failed to compute pHash: {e}")
@@ -90,10 +89,9 @@ class ImageFingerprinter:
         try:
             img = Image.open(BytesIO(content))
             # Convert to RGB if necessary
-            if img.mode != "RGB":
-                img = img.convert("RGB")
+            img_rgb = img.convert("RGB") if img.mode != "RGB" else img
 
-            dhash = imagehash.dhash(img, hash_size=self.hash_size)
+            dhash = imagehash.dhash(img_rgb, hash_size=self.hash_size)
             return str(dhash)
         except Exception as e:
             logger.debug(f"Failed to compute dHash: {e}")
@@ -114,7 +112,7 @@ class ImageFingerprinter:
                 - height: Image height
                 - format: Image format
         """
-        result = {
+        result: dict[str, Any] = {
             "sha256": self.binary_hash(content),
             "phash": self.compute_phash(content),
             "dhash": self.compute_dhash(content),
@@ -186,12 +184,11 @@ class ImageFingerprinter:
             img = Image.open(BytesIO(content))
 
             # Convert to RGB (handles RGBA, palette, etc.)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
+            img_rgb = img.convert("RGB") if img.mode != "RGB" else img
 
             # Strip EXIF by not saving it
             output = BytesIO()
-            img.save(output, format="PNG", optimize=True)
+            img_rgb.save(output, format="PNG", optimize=True)
             output.seek(0)
 
             return output.read()

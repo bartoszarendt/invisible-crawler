@@ -564,6 +564,10 @@ ruff check .
 
 ## Rollout Plan
 
+**Validation Resources**:
+- Queries: [scripts/phase_c_validation.sql](scripts/phase_c_validation.sql)
+- Evidence template: [scripts/phase_c_hardening_validation_template.md](scripts/phase_c_hardening_validation_template.md)
+
 ### Phase 1: Canary (Single Worker, 30-60 minutes)
 **Config**:
 ```bash

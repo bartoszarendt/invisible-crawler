@@ -9,8 +9,9 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urljoin, urlparse
+from uuid import UUID
 
 from scrapy import Spider, signals
 from scrapy.http import Request, Response, TextResponse
@@ -49,6 +50,13 @@ from storage.frontier_checkpoint import (
 )
 
 
+def _redis_from_url(redis_url: str, socket_timeout: int = 2) -> Any:
+    import redis
+
+    redis_module = cast(Any, redis)
+    return redis_module.from_url(redis_url, socket_connect_timeout=socket_timeout)
+
+
 class DiscoverySpider(Spider):
     """Spider for discovering images across multiple domains.
 
@@ -61,6 +69,12 @@ class DiscoverySpider(Spider):
         max_pages: Maximum pages to crawl per domain.
         images_found: Counter for statistics.
     """
+
+    crawl_run_id: UUID | None
+    _claimed_domains: dict[UUID, dict[str, Any]]
+    _claimed_domains_lock: threading.Lock
+    _heartbeat_thread: threading.Thread | None
+    _stop_heartbeat: threading.Event
 
     name = "discovery"
 
@@ -182,9 +196,9 @@ class DiscoverySpider(Spider):
         self.enable_smart_scheduling = get_enable_smart_scheduling()
         self.enable_claim_protocol = get_enable_claim_protocol()
         self.worker_id = f"{socket.gethostname()}-{os.getpid()}"
-        self._claimed_domains: dict[str, dict] = {}  # domain_id -> claim info
+        self._claimed_domains = {}  # domain_id -> claim info
         self._claimed_domains_lock = threading.Lock()
-        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_thread = None
         self._stop_heartbeat = threading.Event()
         # Mid-crawl state flushing (Phase C resilience)
         self.flush_interval = get_domain_stats_flush_interval()
@@ -336,9 +350,7 @@ class DiscoverySpider(Spider):
         redis_url = get_redis_url()
 
         try:
-            import redis
-
-            client = redis.from_url(redis_url, socket_connect_timeout=2)
+            client = _redis_from_url(redis_url, socket_timeout=2)
 
             # Get URLs from sorted set (ordered by priority)
             queue_key = start_urls_key(self.name)
@@ -387,9 +399,7 @@ class DiscoverySpider(Spider):
                 if checkpoint_id:
                     self.logger.info(f"Resuming {domain} from checkpoint: {checkpoint_id}")
                     try:
-                        import redis
-
-                        redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
+                        redis_client = _redis_from_url(get_redis_url(), socket_timeout=2)
 
                         checkpoint_urls = load_checkpoint(checkpoint_id, redis_client)
 
@@ -457,9 +467,7 @@ class DiscoverySpider(Spider):
 
                     # Load checkpoint from Redis
                     try:
-                        import redis
-
-                        redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
+                        redis_client = _redis_from_url(get_redis_url(), socket_timeout=2)
 
                         checkpoint_urls = load_checkpoint(checkpoint_id, redis_client)
 
@@ -540,9 +548,8 @@ class DiscoverySpider(Spider):
             return
 
         # Check if response is HTML/text before parsing
-        content_type = (
-            response.headers.get("Content-Type", b"").decode("utf-8", errors="ignore").lower()
-        )
+        content_type_header = response.headers.get("Content-Type") or b""
+        content_type = content_type_header.decode("utf-8", errors="ignore").lower()
         is_text_response = isinstance(response, TextResponse)
 
         # Be more permissive: try to parse if content-type suggests HTML or if it's a text response
@@ -1021,9 +1028,7 @@ class DiscoverySpider(Spider):
             and self._domain_pending_urls
         ):
             try:
-                import redis
-
-                redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
+                redis_client = _redis_from_url(get_redis_url(), socket_timeout=2)
 
                 run_id_str = str(self.crawl_run_id) if self.crawl_run_id else "unknown"
 
@@ -1212,9 +1217,7 @@ class DiscoverySpider(Spider):
                 ) or self._domain_pending_urls.get(domain, [])
                 if pending:
                     try:
-                        import redis
-
-                        redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
+                        redis_client = _redis_from_url(get_redis_url(), socket_timeout=2)
 
                         run_id_str = str(self.crawl_run_id) if self.crawl_run_id else "unknown"
                         checkpoint_id = save_checkpoint(
@@ -1307,14 +1310,14 @@ class DiscoverySpider(Spider):
             # Phase C: Use claim-safe incremental update
             if self.enable_claim_protocol:
                 # Find domain_id from claimed domains
-                domain_id = None
+                domain_id: UUID | None = None
                 with self._claimed_domains_lock:
                     for did, info in self._claimed_domains.items():
                         if canonicalize_domain(info["domain"], self.strip_subdomains) == canonical_domain:
                             domain_id = did
                             break
 
-                if domain_id:
+                if domain_id is not None:
                     success = increment_domain_stats_claimed(
                         domain_id=domain_id,
                         worker_id=self.worker_id,

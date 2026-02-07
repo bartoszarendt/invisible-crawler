@@ -244,6 +244,29 @@ If scheduler/request serialization changes:
 3. Restart crawler service.
 4. Keep DB rollback limited to tested reversible migrations only.
 
+### 7.3 Phase C Hardening Rollout (Operational)
+
+Use a staged canary with explicit flags and captured evidence.
+
+1. Ensure Phase A/B workers are stopped.
+2. Run a 1-worker canary:
+   - `ENABLE_SMART_SCHEDULING=true ENABLE_CLAIM_PROTOCOL=true scrapy crawl discovery`
+3. Run validation queries:
+   - `psql $DATABASE_URL -f scripts/phase_c_validation.sql`
+4. Scale to 2-3 workers, repeat validation.
+5. Scale to 8 workers, repeat validation.
+6. Save evidence as `phase_c_hardening_validation_YYYYMMDD.md`.
+
+### 7.4 Phase C Hardening Rollback (Operational)
+
+If overlap or instability is detected:
+
+1. Disable Phase C flags:
+   - `export ENABLE_SMART_SCHEDULING=false ENABLE_CLAIM_PROTOCOL=false`
+2. Release active claims:
+   - `python -m crawler.cli release-stuck-claims --force --all-active`
+3. Restart crawlers in Phase A/B mode.
+
 ## 8. Security and Reliability Baseline
 
 1. Do not commit `.env.prod`, `.env.dev`, or secrets.

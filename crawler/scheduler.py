@@ -5,15 +5,65 @@ deduplication, and crawl resume capabilities.
 """
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 from scrapy.http import Request
 from scrapy.settings import Settings
 from scrapy.spiders import Spider
 from scrapy.utils.misc import load_object
-from scrapy_redis.queue import PriorityQueue
-from scrapy_redis.scheduler import Scheduler as RedisScheduler
+
+if TYPE_CHECKING:
+    class RedisSchedulerBase:
+        queue: Any
+        df: Any
+        server: Any
+        spider: Spider
+        persist: bool
+
+        def __init__(
+            self,
+            server: Any,
+            persist: bool = True,
+            flush_on_start: bool = False,
+            queue_key: str = "%(spider)s:requests",
+            queue_cls: str | type = "crawler.scheduler.DomainPriorityQueue",
+            dupefilter_key: str = "%(spider)s:dupefilter",
+            dupefilter_cls: str = "scrapy_redis.dupefilter.RFPDupeFilter",
+            idle_before_close: int = 0,
+            serializer: Any = None,
+            **kwargs: Any,
+        ) -> None:
+            pass
+
+        def open(self, spider: Spider) -> None:
+            pass
+
+        def close(self, reason: str) -> None:
+            pass
+
+        def flush(self) -> None:
+            pass
+
+    class PriorityQueueBase:
+        server: Any
+
+        def __init__(
+            self, server: Any, spider: Spider, key: str, serializer: Any = None
+        ) -> None:
+            pass
+
+        def push(self, request: Request) -> None:
+            pass
+
+        def pop(self, timeout: int = 0) -> Request | None:
+            return None
+
+        def clear(self) -> None:
+            pass
+else:
+    from scrapy_redis.queue import PriorityQueue as PriorityQueueBase
+    from scrapy_redis.scheduler import Scheduler as RedisSchedulerBase
 
 from crawler.redis_keys import domains_key
 from env_config import get_redis_url
@@ -21,7 +71,14 @@ from env_config import get_redis_url
 logger = logging.getLogger(__name__)
 
 
-class InvisibleRedisScheduler(RedisScheduler):
+def _redis_from_url(redis_url: str, socket_timeout: int = 2) -> Any:
+    import redis
+
+    redis_module = cast(Any, redis)
+    return redis_module.from_url(redis_url, socket_connect_timeout=socket_timeout)
+
+
+class InvisibleRedisScheduler(RedisSchedulerBase):
     """Redis-based scheduler with per-domain queue support.
 
     Extends scrapy-redis Scheduler to provide:
@@ -207,7 +264,7 @@ class InvisibleRedisScheduler(RedisScheduler):
         Returns:
             Next Request or None if queue is empty.
         """
-        request = self.queue.pop()
+        request = cast(Request | None, self.queue.pop())
         return request
 
     def has_pending_requests(self) -> bool:
@@ -250,7 +307,7 @@ class InvisibleRedisScheduler(RedisScheduler):
         # This requires the queue to support domain-specific counts
         # For now, return total queue depth
         if hasattr(self.queue, "get_domain_count"):
-            return self.queue.get_domain_count(domain)
+            return int(cast(Any, self.queue).get_domain_count(domain))
         return len(self.queue)
 
     def flush_domain(self, domain: str) -> int:
@@ -269,7 +326,7 @@ class InvisibleRedisScheduler(RedisScheduler):
         return 0
 
 
-class DomainPriorityQueue(PriorityQueue):
+class DomainPriorityQueue(PriorityQueueBase):
     """Priority queue with per-domain tracking.
 
     Extends scrapy-redis PriorityQueue to maintain per-domain
@@ -330,7 +387,7 @@ class DomainPriorityQueue(PriorityQueue):
         Returns:
             Number of pending requests.
         """
-        count = self.server.hget(self.domain_counts_key, domain)
+        count = cast(bytes | None, self.server.hget(self.domain_counts_key, domain))
         return int(count) if count else 0
 
     def clear(self) -> None:
@@ -352,7 +409,7 @@ def check_redis_available(url: str | None = None) -> bool:
 
     url = url or get_redis_url()
     try:
-        client = redis.from_url(url, socket_connect_timeout=2)
+        client = _redis_from_url(url, socket_timeout=2)
         client.ping()
         return True
     except redis.ConnectionError:

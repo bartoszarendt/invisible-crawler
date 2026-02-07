@@ -55,7 +55,7 @@ COOKIES_ENABLED = False
 TELNETCONSOLE_ENABLED = False
 
 # Override the default request headers:
-DEFAULT_REQUEST_HEADERS = {
+DEFAULT_REQUEST_HEADERS: dict[str, str] = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en",
     "Accept-Encoding": "gzip, deflate, br",
@@ -64,17 +64,17 @@ DEFAULT_REQUEST_HEADERS = {
 }
 
 # Enable or disable spider middlewares
-SPIDER_MIDDLEWARES = {
+SPIDER_MIDDLEWARES: dict[str, int] = {
     # "crawler.middlewares.CrawlerSpiderMiddleware": 543,
 }
 
 # Enable or disable downloader middlewares
-DOWNLOADER_MIDDLEWARES = {
+DOWNLOADER_MIDDLEWARES: dict[str, int] = {
     # "crawler.middlewares.CrawlerDownloaderMiddleware": 543,
 }
 
 # Configure item pipelines
-ITEM_PIPELINES = {
+ITEM_PIPELINES: dict[str, int] = {
     "crawler.pipelines.ImageProcessingPipeline": 300,
 }
 
@@ -103,7 +103,7 @@ FEED_EXPORT_ENCODING = "utf-8"
 # Retry configuration
 RETRY_ENABLED = get_scrapy_retry_enabled()
 RETRY_TIMES = get_scrapy_retry_times()
-RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
+RETRY_HTTP_CODES: list[int] = [500, 502, 503, 504, 408, 429]
 
 # Timeout configuration
 DOWNLOAD_TIMEOUT = get_scrapy_download_timeout()

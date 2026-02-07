@@ -546,6 +546,7 @@ Phase C is the **highest-risk phase** of domain tracking. It fundamentally chang
    - `ENABLE_SMART_SCHEDULING`: Query domains table for candidates (default: false)
    - `ENABLE_CLAIM_PROTOCOL`: Claim domains before crawl (default: false)
    - **Both must be enabled together** for Phase C
+   - `DOMAIN_STATS_FLUSH_INTERVAL_PAGES`: Pages between mid-crawl flushes (default: 100)
 
 7. **Tests** (42+ tests for Phase C)
    - `tests/test_domain_claim.py`: Claim protocol, lease expiry, version conflicts, force-release (28 tests)
@@ -627,6 +628,20 @@ python -m crawler.cli cleanup-stale-runs --older-than-minutes 60
 - Queue isolation: Phase C uses local scheduler (per-worker queues) to prevent cross-worker domain overlap
 - Force-release CLI: `release-stuck-claims --force` enables recovery from dead workers
 - Stale run cleanup: `cleanup-stale-runs` marks inactive runs as failed for operational hygiene
+
+### Phase C Hardening Validation Runbook
+
+Use the SQL script and evidence template for reproducible operational validation:
+
+- Queries: [scripts/phase_c_validation.sql](scripts/phase_c_validation.sql)
+- Evidence template: [scripts/phase_c_hardening_validation_template.md](scripts/phase_c_hardening_validation_template.md)
+
+Recommended flow:
+
+1. Run a 1-worker canary and capture query output.
+2. Repeat with 2-3 workers.
+3. Repeat with 8 workers.
+4. Save results as `phase_c_hardening_validation_YYYYMMDD.md`.
 
 ### Database Schema Additions
 

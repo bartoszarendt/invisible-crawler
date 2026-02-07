@@ -6,8 +6,9 @@ to avoid blocking Scrapy's reactor during image fetches.
 
 import hashlib
 import logging
+from collections.abc import Generator
 from io import BytesIO
-from typing import Any
+from typing import Any, cast
 
 from PIL import Image
 from scrapy.http import Response
@@ -69,10 +70,10 @@ class AsyncImageFetcher:
         self.max_file_size = max_file_size
         self.min_dimensions = (min_width, min_height)
         self.timeout = timeout
-        self.agent = Agent(reactor)
+        self.agent = cast(Any, Agent)(reactor)
 
     @defer.inlineCallbacks
-    def fetch(self, url: str) -> defer.Deferred[ImageFetchResult]:
+    def fetch(self, url: str) -> Generator[defer.Deferred[Any], Any, ImageFetchResult]:
         """Fetch and validate an image from a URL asynchronously.
 
         Args:
@@ -120,7 +121,8 @@ class AsyncImageFetcher:
         content_type_headers = response.headers.getRawHeaders(b"Content-Type", [])
         content_type = ""
         if content_type_headers:
-            content_type = content_type_headers[0].decode("utf-8", errors="ignore")
+            header = content_type_headers[0] or b""
+            content_type = header.decode("utf-8", errors="ignore")
 
         is_valid, error_reason = validate_content_type(content_type)
         if not is_valid:
@@ -231,7 +233,7 @@ class AsyncImageFetcher:
 
         # Make request
         d = self.agent.request(b"GET", url.encode("utf-8"), headers, None)
-        return d
+        return cast(defer.Deferred[Any], d)
 
     def _parse_image_dimensions(self, content: bytes) -> tuple[int | None, int | None, str | None]:
         """Parse image dimensions from binary content.
@@ -302,7 +304,8 @@ class ScrapyImageDownloader:
             )
 
         # Validate content type (strict: reject if missing or unsupported)
-        content_type = response.headers.get("Content-Type", b"").decode("utf-8", errors="ignore")
+        content_type_header = response.headers.get("Content-Type") or b""
+        content_type = content_type_header.decode("utf-8", errors="ignore")
 
         is_valid, error_reason = validate_content_type(content_type)
         if not is_valid:

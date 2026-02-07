@@ -6,6 +6,7 @@ enabling domain tracking, statistics updates, and backfill operations.
 
 import logging
 from typing import Any
+from uuid import UUID
 
 from processor.domain_canonicalization import canonicalize_domain
 from storage.db import get_cursor
@@ -232,7 +233,7 @@ def backfill_domains_from_crawl_log() -> dict[str, int]:
 
             # Aggregate by canonical domain using Python-side canonicalization
             # (handles IDN, trailing dots, default ports, etc.)
-            canonical_agg: dict[str, dict] = {}
+            canonical_agg: dict[str, dict[str, Any]] = {}
             for row in raw_rows:
                 raw_domain, total, pages_ok, imgs, errs, first, last = row
                 try:
@@ -446,7 +447,7 @@ def clear_frontier_checkpoint(domain: str) -> bool:
 # Phase C: Domain Claim Protocol for multi-worker concurrency
 
 
-def claim_domains(worker_id: str, batch_size: int = 10) -> list[dict]:
+def claim_domains(worker_id: str, batch_size: int = 10) -> list[dict[str, Any]]:
     """Atomically claim unclaimed or expired domains using FOR UPDATE SKIP LOCKED.
 
     This is the core of the Phase C concurrency protocol. Uses PostgreSQL's
@@ -528,7 +529,7 @@ def claim_domains(worker_id: str, batch_size: int = 10) -> list[dict]:
         return []
 
 
-def renew_claim(domain_id: str, worker_id: str) -> bool:
+def renew_claim(domain_id: UUID, worker_id: str) -> bool:
     """Renew domain claim (heartbeat) to extend lease.
 
     Workers should call this periodically (every 10 minutes) to prevent
@@ -565,7 +566,7 @@ def renew_claim(domain_id: str, worker_id: str) -> bool:
 
 
 def release_claim(
-    domain_id: str,
+    domain_id: UUID,
     worker_id: str,
     expected_version: int,
     **updates: Any,
@@ -699,7 +700,7 @@ def release_claim(
 
 
 def transition_domain_status(
-    domain_id: str,
+    domain_id: UUID,
     from_status: str,
     to_status: str,
     worker_id: str,
@@ -777,7 +778,7 @@ def expire_stale_claims() -> int:
                   AND claim_expires_at < CURRENT_TIMESTAMP
                 RETURNING id;
                 """)
-            count = cur.rowcount
+            count = int(cur.rowcount)
             if count > 0:
                 logger.warning(f"Expired {count} stale domain claims")
             return count
@@ -922,7 +923,7 @@ def force_release_worker_claims(worker_id: str) -> int:
                 """,
                 (worker_id,),
             )
-            count = cur.rowcount
+            count = int(cur.rowcount)
             if count > 0:
                 logger.info(f"Force-released {count} claims for worker: {worker_id}")
             return count
@@ -951,7 +952,7 @@ def force_release_all_claims() -> int:
                 RETURNING id
                 """
             )
-            count = cur.rowcount
+            count = int(cur.rowcount)
             if count > 0:
                 logger.warning(f"Force-released ALL {count} claims globally")
             return count
@@ -961,13 +962,13 @@ def force_release_all_claims() -> int:
 
 
 def increment_domain_stats_claimed(
-    domain_id: int,
+    domain_id: UUID,
     worker_id: str,
     pages_crawled_delta: int = 0,
     images_found_delta: int = 0,
     images_stored_delta: int = 0,
     total_error_count_delta: int = 0,
-    crawl_run_id: int | None = None,
+    crawl_run_id: UUID | None = None,
 ) -> bool:
     """Increment domain stats for a CLAIMED domain (optimistic locking).
 
@@ -1012,14 +1013,15 @@ def increment_domain_stats_claimed(
                     worker_id,
                 ),
             )
-            return cur.rowcount > 0
+            count = int(cur.rowcount)
+            return count > 0
     except Exception as e:
         logger.error(f"Failed to increment stats for domain {domain_id}: {e}")
         return False
 
 
 def increment_crawl_run_stats(
-    crawl_run_id: int, pages_delta: int = 0, images_delta: int = 0
+    crawl_run_id: UUID, pages_delta: int = 0, images_delta: int = 0
 ) -> None:
     """Increment crawl_run stats incrementally (for mid-crawl flushing).
 
