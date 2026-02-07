@@ -65,9 +65,11 @@ def canonicalize_domain(url: str | None, strip_subdomains: bool = False) -> str:
         logger.warning(f"Failed to parse URL {url!r}: {e}")
         raise ValueError(f"Invalid URL: {url!r}") from e
 
-    # Strip port if present
-    if ":" in domain:
-        domain = domain.split(":")[0]
+    # Strip default ports only (80/443); keep non-default ports for identity
+    if ":" in domain and not domain.startswith("["):
+        host, _, port = domain.rpartition(":")
+        if port in ("80", "443"):
+            domain = host
 
     # Strip trailing dot
     domain = domain.rstrip(".")

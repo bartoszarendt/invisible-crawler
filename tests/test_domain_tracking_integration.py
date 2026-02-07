@@ -105,7 +105,7 @@ class TestDomainTrackingIntegration:
         spider = DiscoverySpider(seeds="test_seeds.txt")
         spider.crawl_run_id = "test-run-id"
 
-        # Simulate domain stats from crawl (images_stored not tracked by spider)
+        # Simulate domain stats from crawl
         spider._domain_stats = {"example.com": {"pages": 5, "images_found": 20}}
 
         # Close spider
@@ -115,7 +115,11 @@ class TestDomainTrackingIntegration:
         mock_update_stats.assert_called_once_with(
             domain="example.com",
             pages_crawled_delta=5,
+            pages_discovered_delta=5,
             images_found_delta=20,
+            images_stored_delta=0,
+            total_error_count_delta=0,
+            consecutive_error_count=0,
             status="active",
             last_crawl_run_id="test-run-id",
         )

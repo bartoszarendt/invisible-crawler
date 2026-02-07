@@ -319,7 +319,7 @@ def backfill_domains_command(args: argparse.Namespace) -> int:
 
 
 def domain_status_command(args: argparse.Namespace) -> int:
-    """Show domain status summary.
+    """Show domain status summary or list domains by status.
 
     Args:
         args: Command line arguments.
@@ -327,31 +327,285 @@ def domain_status_command(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 for success, 1 for failure).
     """
+    status_filter = args.status
+    limit = args.limit
+
     try:
-        from storage.domain_repository import get_domain_stats_summary
+        # If no status filter, show summary
+        if not status_filter:
+            from storage.domain_repository import get_domain_stats_summary
 
-        stats = get_domain_stats_summary()
+            stats = get_domain_stats_summary()
 
-        if "error" in stats:
-            logger.error(f"Failed to get domain stats: {stats['error']}")
-            return 1
+            if "error" in stats:
+                logger.error(f"Failed to get domain stats: {stats['error']}")
+                return 1
 
-        print(f"\n{'STATUS':<15} {'COUNT':<10} {'AVG PAGES':<12} {'TOTAL IMAGES':<15}")
-        print("-" * 55)
+            print(f"\n{'STATUS':<15} {'COUNT':<10} {'AVG PAGES':<12} {'TOTAL IMAGES':<15}")
+            print("-" * 55)
 
-        for status, data in sorted(stats["by_status"].items()):
+            for status, data in sorted(stats["by_status"].items()):
+                print(
+                    f"{status:<15} {data['count']:<10} {data['avg_pages'] or 0:<12} {data['total_images'] or 0:<15}"
+                )
+
+            print("-" * 55)
             print(
-                f"{status:<15} {data['count']:<10} {data['avg_pages'] or 0:<12} {data['total_images'] or 0:<15}"
+                f"{'TOTAL':<15} {stats['total_domains']:<10} {'':<12} {stats['total_images']:<15}"
+            )
+            print()
+
+            return 0
+
+        # Show domains with specific status
+        from storage.domain_repository import get_domains_by_status
+
+        domains = get_domains_by_status(status_filter, limit=limit)
+
+        if not domains:
+            print(f"No domains found with status '{status_filter}'")
+            return 0
+
+        print(f"\nDomains with status '{status_filter}' (limit: {limit}):")
+        print(f"{'DOMAIN':<40} {'PRIORITY':<10} {'PAGES':<10} {'IMAGES':<10} {'CLAIMED BY':<20}")
+        print("-" * 100)
+
+        for domain in domains:
+            claimed = domain.get("claimed_by", "") or ""
+            expires_at = domain.get("claim_expires_at")
+            if expires_at:
+                try:
+                    claimed += f" (expires {expires_at.strftime('%H:%M')})"
+                except (AttributeError, ValueError):
+                    claimed += f" (expires {expires_at})"
+            print(
+                f"{domain['domain']:<40} {domain['priority_score']:<10} "
+                f"{domain['pages_crawled'] or 0:<10} {domain['images_stored'] or 0:<10} "
+                f"{claimed[:38]:<38}"
             )
 
-        print("-" * 55)
-        print(f"{'TOTAL':<15} {stats['total_domains']:<10} {'':<12} {stats['total_images']:<15}")
+        print()
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to get domain status: {e}")
+        return 1
+
+
+def domain_info_command(args: argparse.Namespace) -> int:
+    """Show detailed information about a specific domain.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
+    domain = args.domain
+
+    try:
+        from storage.domain_repository import get_domain
+
+        info = get_domain(domain)
+
+        if not info:
+            print(f"Domain '{domain}' not found")
+            return 1
+
+        print(f"\nDomain: {info['domain']}")
+        print(f"ID: {info['id']}")
+        print(f"Status: {info['status']}")
+        print(f"Source: {info.get('source', 'N/A')}")
+        print(f"Seed Rank: {info.get('seed_rank', 'N/A')}")
+        print(f"Version: {info.get('version', 0)}")
+        print()
+        print(f"Pages Crawled: {info['pages_crawled']}")
+        print(f"Pages Discovered: {info.get('pages_discovered', 0)}")
+        print(f"Images Found: {info['images_found']}")
+        print(f"Images Stored: {info['images_stored']}")
+        print(
+            f"Image Yield Rate: {info['image_yield_rate']:.4f}"
+            if info["image_yield_rate"]
+            else "Image Yield Rate: N/A"
+        )
+        print()
+        print(f"Total Errors: {info.get('total_error_count', 0)}")
+        print(f"Consecutive Errors: {info.get('consecutive_error_count', 0)}")
+        if info.get('block_reason'):
+            print(f"Block Reason: {info['block_reason']}")
+        print()
+        print(f"First Seen: {info['first_seen_at']}")
+        print(f"Last Crawled: {info['last_crawled_at'] or 'Never'}")
+        print(f"Priority Score: {info.get('priority_score', 'N/A')}")
+        print()
+        if info.get('frontier_checkpoint_id'):
+            print(f"Frontier Checkpoint: {info['frontier_checkpoint_id']}")
+            print(f"Frontier Size: {info.get('frontier_size', 0)} URLs")
+        if info.get('claimed_by'):
+            print(f"Claimed By: {info['claimed_by']}")
+            expires_at = info.get('claim_expires_at')
+            if expires_at:
+                try:
+                    print(f"Claim Expires: {expires_at.strftime('%Y-%m-%d %H:%M:%S')}")
+                except (AttributeError, ValueError):
+                    print(f"Claim Expires: {expires_at}")
         print()
 
         return 0
 
     except Exception as e:
-        logger.error(f"Failed to get domain status: {e}")
+        logger.error(f"Failed to get domain info: {e}")
+        return 1
+
+
+def recalculate_priorities_command(args: argparse.Namespace) -> int:
+    """Recalculate priority scores for all domains.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
+    dry_run = args.dry_run
+
+    try:
+        from storage.priority_calculator import recalculate_priorities
+
+        if dry_run:
+            print("DRY RUN: Would recalculate priorities for all domains")
+            return 0
+
+        print("Recalculating domain priorities...")
+        stats = recalculate_priorities()
+
+        print(f"\nUpdated {stats['updated']} domains:")
+        print(f"  Pending: {stats['pending']}")
+        print(f"  Active: {stats['active']}")
+        print(f"  Exhausted: {stats['exhausted']}")
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to recalculate priorities: {e}")
+        return 1
+
+
+def release_stuck_claims_command(args: argparse.Namespace) -> int:
+    """Release stuck/expired domain claims.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
+    dry_run = args.dry_run
+
+    try:
+        from storage.domain_repository import expire_stale_claims, get_active_claims
+
+        # Show current active claims
+        active_claims = get_active_claims()
+        if active_claims:
+            print("\nActive claims before cleanup:")
+            for claim in active_claims:
+                print(f"  {claim['worker_id']}: {claim['count']} domains")
+
+        if dry_run:
+            print("\nDRY RUN: Would release expired claims")
+            return 0
+
+        count = expire_stale_claims()
+        print(f"\nReleased {count} stuck/expired claims")
+
+        # Show remaining active claims
+        active_claims = get_active_claims()
+        if active_claims:
+            print("\nRemaining active claims:")
+            for claim in active_claims:
+                print(f"  {claim['worker_id']}: {claim['count']} domains")
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to release stuck claims: {e}")
+        return 1
+
+
+def domain_reset_command(args: argparse.Namespace) -> int:
+    """Reset a domain for re-crawling.
+
+    Clears crawl stats and sets status back to 'pending' so the domain
+    will be picked up again by the scheduler.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
+    domain = args.domain
+    force = args.force
+
+    try:
+        from storage.domain_repository import get_domain
+
+        info = get_domain(domain)
+        if not info:
+            print(f"Domain '{domain}' not found")
+            return 1
+
+        print(f"\nDomain: {info['domain']}")
+        print(f"Current Status: {info['status']}")
+        print(f"Pages Crawled: {info['pages_crawled']}")
+        print(f"Images Stored: {info['images_stored']}")
+
+        if not force:
+            confirm = input("\nReset this domain? This will clear all stats. [y/N] ")
+            if confirm.lower() not in ("y", "yes"):
+                print("Aborted.")
+                return 0
+
+        from storage.db import get_cursor
+
+        with get_cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE domains
+                SET status = 'pending',
+                    pages_crawled = 0,
+                    pages_discovered = 0,
+                    images_found = 0,
+                    images_stored = 0,
+                    total_error_count = 0,
+                    consecutive_error_count = 0,
+                    image_yield_rate = NULL,
+                    last_crawled_at = NULL,
+                    last_crawl_run_id = NULL,
+                    frontier_checkpoint_id = NULL,
+                    frontier_size = 0,
+                    claimed_by = NULL,
+                    claim_expires_at = NULL,
+                    block_reason = NULL,
+                    block_reason_code = NULL,
+                    version = version + 1
+                WHERE domain = %s
+                RETURNING id
+                """,
+                (domain,),
+            )
+            result = cursor.fetchone()
+            if result:
+                print(f"\nDomain '{domain}' has been reset to 'pending' status.")
+            else:
+                print(f"\nFailed to reset domain '{domain}'.")
+                return 1
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to reset domain: {e}")
         return 1
 
 
@@ -443,9 +697,71 @@ def main() -> int:
     # domain-status command
     domain_parser = subparsers.add_parser(
         "domain-status",
-        help="Show domain tracking status summary",
+        help="Show domain tracking status summary or list domains by status",
+    )
+    domain_parser.add_argument(
+        "--status",
+        choices=["pending", "active", "exhausted", "blocked", "unreachable"],
+        help="Filter by status (if omitted, shows summary)",
+    )
+    domain_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum domains to show when filtering by status (default: 50)",
     )
     domain_parser.set_defaults(func=domain_status_command)
+
+    # domain-info command
+    info_parser = subparsers.add_parser(
+        "domain-info",
+        help="Show detailed information about a specific domain",
+    )
+    info_parser.add_argument(
+        "domain",
+        help="Domain name to look up",
+    )
+    info_parser.set_defaults(func=domain_info_command)
+
+    # recalculate-priorities command
+    priority_parser = subparsers.add_parser(
+        "recalculate-priorities",
+        help="Recalculate priority scores for all domains",
+    )
+    priority_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+    priority_parser.set_defaults(func=recalculate_priorities_command)
+
+    # release-stuck-claims command
+    release_parser = subparsers.add_parser(
+        "release-stuck-claims",
+        help="Release expired domain claims (cleanup utility)",
+    )
+    release_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+    release_parser.set_defaults(func=release_stuck_claims_command)
+
+    # domain-reset command
+    reset_parser = subparsers.add_parser(
+        "domain-reset",
+        help="Reset a domain for re-crawling (clears stats and sets status to pending)",
+    )
+    reset_parser.add_argument(
+        "domain",
+        help="Domain name to reset",
+    )
+    reset_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip confirmation prompt",
+    )
+    reset_parser.set_defaults(func=domain_reset_command)
 
     args = parser.parse_args()
 

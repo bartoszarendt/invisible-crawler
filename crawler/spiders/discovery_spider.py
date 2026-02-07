@@ -4,6 +4,10 @@ This spider crawls domains from a seed file, extracting image URLs
 from HTML pages and following same-domain links.
 """
 
+import os
+import socket
+import threading
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -16,19 +20,29 @@ from env_config import (
     get_crawler_max_pages,
     get_default_max_pages_per_run,
     get_domain_canonicalization_strip_subdomains,
+    get_enable_claim_protocol,
     get_enable_domain_tracking,
     get_enable_per_domain_budget,
+    get_enable_smart_scheduling,
     get_redis_url,
 )
 from processor.domain_canonicalization import canonicalize_domain
 from processor.media_policy import ALLOWED_EXTENSIONS
 from storage.db import get_cursor
 from storage.domain_repository import (
+    claim_domains,
     clear_frontier_checkpoint,
     get_domain,
+    release_claim,
+    renew_claim,
     update_domain_stats,
     update_frontier_checkpoint,
     upsert_domain,
+)
+from storage.frontier_checkpoint import (
+    delete_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
 )
 
 
@@ -67,6 +81,7 @@ class DiscoverySpider(Spider):
         """Signal handler called when spider is opened.
 
         Creates a crawl run record in the database.
+        Starts heartbeat thread for claim renewal if Phase C is enabled.
 
         Args:
             spider: The spider instance.
@@ -88,6 +103,43 @@ class DiscoverySpider(Spider):
         except Exception as e:
             self.logger.warning(f"Failed to create crawl run: {e}")
             self.crawl_run_id = None
+
+        # Phase C: Start heartbeat thread for claim renewal
+        if self.enable_claim_protocol and self.enable_smart_scheduling:
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._heartbeat_thread.start()
+            self.logger.info(f"Started claim renewal heartbeat for worker {self.worker_id}")
+
+    def _heartbeat_loop(self) -> None:
+        """Background thread: renew domain claims every 10 minutes.
+
+        This prevents lease expiry during long crawls. Runs until
+        _stop_heartbeat event is set.
+        """
+        while not self._stop_heartbeat.is_set():
+            time.sleep(600)  # 10 minutes
+
+            with self._claimed_domains_lock:
+                if not self._claimed_domains:
+                    continue
+                domains_snapshot = list(self._claimed_domains.items())
+
+            for domain_id, info in domains_snapshot:
+                try:
+                    success = renew_claim(domain_id, self.worker_id)
+                    with self._claimed_domains_lock:
+                        if domain_id not in self._claimed_domains:
+                            continue  # Claim was released while renewing
+                        if success:
+                            self.logger.debug(f"Renewed claim for {info['domain']}")
+                            self._claimed_domains[domain_id]["version"] += 1
+                        else:
+                            self.logger.warning(
+                                f"Failed to renew claim for {info['domain']} (expired?)"
+                            )
+                            del self._claimed_domains[domain_id]
+                except Exception as e:
+                    self.logger.error(f"Heartbeat error for {info['domain']}: {e}")
 
     def __init__(self, seeds: str | None = None, **kwargs: Any) -> None:
         """Initialize the spider with seed domains.
@@ -123,17 +175,46 @@ class DiscoverySpider(Spider):
         self.max_pages_per_run = get_default_max_pages_per_run()
         self._domain_pages_crawled: dict[str, int] = {}  # Pages crawled per domain this run
         self._domain_pending_urls: dict[str, list[dict[str, Any]]] = {}
+        # Smart scheduling and claim protocol (Phase C)
+        self.enable_smart_scheduling = get_enable_smart_scheduling()
+        self.enable_claim_protocol = get_enable_claim_protocol()
+        self.worker_id = f"{socket.gethostname()}-{os.getpid()}"
+        self._claimed_domains: dict[str, dict] = {}  # domain_id -> claim info
+        self._claimed_domains_lock = threading.Lock()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._stop_heartbeat = threading.Event()
 
     def start_requests(self) -> Any:
         """Generate initial requests from seed domains.
 
-        Supports two modes:
+        Supports three modes:
+        - Phase C (Smart Scheduling): Query domains table with claim protocol
         - Phase 2 (Redis): Consume seeds from Redis start_urls sorted set
         - Phase 1 (File): Read seeds from local seed file
 
         Yields:
             Request objects for each seed domain.
         """
+        # Phase C: Smart scheduling with claim protocol
+        if self.enable_smart_scheduling and self.enable_claim_protocol:
+            self.logger.info("Phase C: Using smart scheduling with claim protocol")
+            try:
+                smart_requests = list(self._start_requests_smart_scheduling())
+                if smart_requests:
+                    yield from smart_requests
+                else:
+                    self.logger.warning(
+                        "Smart scheduling returned no domains. "
+                        "All domains may be claimed by other workers or exhausted."
+                    )
+            except Exception as e:
+                self.logger.error(
+                    f"Smart scheduling failed: {e}. "
+                    "Not falling back to seeds — Phase C requires claim protocol."
+                )
+            # Phase C never falls back to seed-based scheduling
+            return
+
         # Try Redis start_urls first (Phase 2 mode)
         redis_seeds = list(self._get_redis_start_urls())
         if redis_seeds:
@@ -245,6 +326,87 @@ class DiscoverySpider(Spider):
             self.logger.debug(f"Could not fetch Redis start_urls: {e}")
             return []
 
+    def _start_requests_smart_scheduling(self) -> Any:
+        """Phase C: Generate requests using smart scheduling from domains table.
+
+        Claims domains atomically using the claim protocol, then yields requests
+        for those domains. Supports resume from frontier checkpoints.
+
+        Yields:
+            Request objects for claimed domains.
+        """
+        try:
+            # Claim domains from the database
+            claimed = claim_domains(self.worker_id, batch_size=10)
+
+            if not claimed:
+                self.logger.info("No domains available to claim")
+                return
+
+            self.logger.info(f"Claimed {len(claimed)} domains for crawling")
+
+            for domain_row in claimed:
+                domain_id = domain_row["id"]
+                domain = domain_row["domain"]
+                version = domain_row["version"]
+                checkpoint_id = domain_row.get("frontier_checkpoint_id")
+
+                # Track claimed domain for heartbeat and release
+                with self._claimed_domains_lock:
+                    self._claimed_domains[domain_id] = {
+                        "domain": domain,
+                        "version": version,
+                    }
+
+                # Resume from checkpoint if exists
+                if checkpoint_id:
+                    self.logger.info(f"Resuming {domain} from checkpoint: {checkpoint_id}")
+                    try:
+                        import redis
+
+                        redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
+
+                        checkpoint_urls = load_checkpoint(checkpoint_id, redis_client)
+
+                        if checkpoint_urls:
+                            self.logger.info(
+                                f"Loaded {len(checkpoint_urls)} URLs from checkpoint for {domain}"
+                            )
+                            for entry in checkpoint_urls:
+                                yield Request(
+                                    url=entry["url"],
+                                    callback=self.parse,
+                                    errback=self.handle_error,
+                                    meta={
+                                        "depth": entry["depth"],
+                                        "domain": domain,
+                                        "domain_id": domain_id,
+                                    },
+                                )
+                            # Clear checkpoint after successful load
+                            delete_checkpoint(checkpoint_id, redis_client)
+                            clear_frontier_checkpoint(domain)
+                            continue  # Don't yield root URL
+                        else:
+                            self.logger.warning(
+                                f"Checkpoint {checkpoint_id} empty, starting fresh for {domain}"
+                            )
+                            clear_frontier_checkpoint(domain)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to load checkpoint for {domain}: {e}")
+
+                # Fresh start: yield root URL
+                self.logger.info(f"Starting fresh crawl for {domain}")
+                yield Request(
+                    url=f"https://{domain}",
+                    callback=self.parse,
+                    errback=self.handle_error,
+                    meta={"depth": 0, "domain": domain, "domain_id": domain_id},
+                )
+
+        except Exception as e:
+            self.logger.error(f"Smart scheduling failed: {e}")
+
     def _yield_start_requests(self, url: str, domain_netloc: str) -> Any:
         """Yield start requests for a domain, with optional checkpoint resume.
 
@@ -273,10 +435,6 @@ class DiscoverySpider(Spider):
                         import redis
 
                         redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
-                        from storage.frontier_checkpoint import (
-                            delete_checkpoint,
-                            load_checkpoint,
-                        )
 
                         checkpoint_urls = load_checkpoint(checkpoint_id, redis_client)
 
@@ -391,16 +549,19 @@ class DiscoverySpider(Spider):
         self.images_found += len(image_urls)
 
         # Domain tracking: update per-domain stats
+        _tracking_canonical = None
         if self.enable_domain_tracking:
             try:
-                canonical_domain = canonicalize_domain(current_domain, self.strip_subdomains)
-                if canonical_domain not in self._domain_stats:
-                    self._domain_stats[canonical_domain] = {
+                _tracking_canonical = canonicalize_domain(current_domain, self.strip_subdomains)
+                if _tracking_canonical not in self._domain_stats:
+                    self._domain_stats[_tracking_canonical] = {
                         "pages": 0,
                         "images_found": 0,
+                        "errors": 0,
+                        "links_discovered": 0,
                     }
-                self._domain_stats[canonical_domain]["pages"] += 1
-                self._domain_stats[canonical_domain]["images_found"] += len(image_urls)
+                self._domain_stats[_tracking_canonical]["pages"] += 1
+                self._domain_stats[_tracking_canonical]["images_found"] += len(image_urls)
             except Exception as e:
                 self.logger.debug(f"Failed to update domain stats for {current_domain}: {e}")
 
@@ -433,6 +594,10 @@ class DiscoverySpider(Spider):
 
         # Extract links before budget check so we can track them
         extracted_links = self._extract_links(response, current_domain)
+
+        # Track discovered links for pages_discovered metric
+        if _tracking_canonical and _tracking_canonical in self._domain_stats:
+            self._domain_stats[_tracking_canonical]["links_discovered"] += len(extracted_links)
 
         # Check budget BEFORE incrementing counter (so current page is allowed)
         if self.enable_per_domain_budget:
@@ -728,6 +893,21 @@ class DiscoverySpider(Spider):
                     except Exception:
                         pass
 
+        # Track errors in domain stats for persistent storage (all errors, not just blocking)
+        if self.enable_domain_tracking and domain != "unknown":
+            try:
+                err_canonical = canonicalize_domain(domain, self.strip_subdomains)
+                if err_canonical not in self._domain_stats:
+                    self._domain_stats[err_canonical] = {
+                        "pages": 0,
+                        "images_found": 0,
+                        "errors": 0,
+                        "links_discovered": 0,
+                    }
+                self._domain_stats[err_canonical]["errors"] += 1
+            except Exception:
+                pass
+
         # Best-effort crawl log for failures
         self._log_crawl_entry(
             page_url=failure.request.url if hasattr(failure, "request") else "unknown",
@@ -744,6 +924,19 @@ class DiscoverySpider(Spider):
         Args:
             reason: Why the spider closed.
         """
+        # Phase C: Stop heartbeat thread
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._stop_heartbeat.set()
+            self._heartbeat_thread.join(timeout=5)
+            self.logger.debug("Stopped claim renewal heartbeat")
+
+        # Compute images_stored per domain from crawl_log for accurate tracking
+        domain_images_stored = self._compute_domain_images_stored()
+
+        # Phase C: Release all domain claims with stats update
+        if self.enable_claim_protocol and self._claimed_domains:
+            self._release_all_claims(domain_images_stored)
+
         # Update crawl run if one was created
         if self.crawl_run_id:
             try:
@@ -800,7 +993,6 @@ class DiscoverySpider(Spider):
                 import redis
 
                 redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
-                from storage.frontier_checkpoint import save_checkpoint
 
                 run_id_str = str(self.crawl_run_id) if self.crawl_run_id else "unknown"
 
@@ -845,12 +1037,19 @@ class DiscoverySpider(Spider):
                     update_domain_stats(
                         domain=domain,
                         pages_crawled_delta=stats["pages"],
+                        pages_discovered_delta=stats["pages"] + stats.get("links_discovered", 0),
                         images_found_delta=stats["images_found"],
+                        images_stored_delta=domain_images_stored.get(domain, 0),
+                        total_error_count_delta=stats.get("errors", 0),
+                        consecutive_error_count=(
+                            0 if stats["pages"] > 0 else stats.get("errors", 0)
+                        ),
                         status=status,
                         last_crawl_run_id=str(self.crawl_run_id) if self.crawl_run_id else None,
                     )
                     self.logger.debug(
-                        f"Updated domain stats: {domain} (pages: {stats['pages']}, images: {stats['images_found']})"
+                        f"Updated domain stats: {domain} "
+                        f"(pages: {stats['pages']}, images_stored: {domain_images_stored.get(domain, 0)})"
                     )
                 self.logger.info(f"Domain stats updated for {len(self._domain_stats)} domains")
             except Exception as e:
@@ -862,6 +1061,152 @@ class DiscoverySpider(Spider):
         self.logger.info(f"Images found: {self.images_found}")
         self.logger.info(f"Images downloaded: {self.images_downloaded}")
         self.logger.info("=" * 50)
+
+    def _compute_domain_images_stored(self) -> dict[str, int]:
+        """Compute images_stored per domain from crawl_log for the current run.
+
+        Queries the crawl_log table for SUM(images_downloaded) grouped by domain,
+        then canonicalizes domain names for consistent lookup.
+
+        Returns:
+            Dict mapping canonical domain name to images_stored count.
+        """
+        result: dict[str, int] = {}
+        if not self.crawl_run_id or not self.enable_domain_tracking:
+            return result
+        try:
+            with get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT domain, COALESCE(SUM(images_downloaded), 0)
+                    FROM crawl_log
+                    WHERE crawl_run_id = %s AND domain IS NOT NULL
+                    GROUP BY domain
+                    """,
+                    (self.crawl_run_id,),
+                )
+                for row in cursor.fetchall():
+                    try:
+                        canonical = canonicalize_domain(row[0], self.strip_subdomains)
+                        result[canonical] = result.get(canonical, 0) + int(row[1])
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.logger.warning(f"Failed to query images_stored per domain: {e}")
+        return result
+
+    def _release_all_claims(self, domain_images_stored: dict[str, int]) -> None:
+        """Phase C: Release all claimed domains with optimistic locking.
+
+        Atomically releases each domain claim and updates stats.
+        Retries on version conflicts (up to 3 attempts).
+
+        Args:
+            domain_images_stored: Dict mapping canonical domain to images_stored count,
+                computed from crawl_log for the current run.
+        """
+        with self._claimed_domains_lock:
+            claimed_snapshot = list(self._claimed_domains.items())
+
+        self.logger.info(f"Releasing {len(claimed_snapshot)} domain claims...")
+
+        for domain_id, info in claimed_snapshot:
+            domain = info["domain"]
+            version = info["version"]
+
+            # Get stats for this domain
+            canonical_domain = canonicalize_domain(domain, self.strip_subdomains)
+            stats = self._domain_stats.get(
+                canonical_domain,
+                {"pages": 0, "images_found": 0, "errors": 0, "links_discovered": 0},
+            )
+            pages_crawled = stats.get("pages", 0)
+            images_found = stats.get("images_found", 0)
+            images_stored = domain_images_stored.get(canonical_domain, 0)
+            errors = stats.get("errors", 0)
+
+            # Determine final status — check both canonical and raw keys for pending URLs
+            if canonical_domain in self._blocked_domains_canonical:
+                status = "blocked"
+            else:
+                pending = self._domain_pending_urls.get(
+                    canonical_domain, []
+                ) or self._domain_pending_urls.get(domain, [])
+                status = "active" if pending else "exhausted"
+
+            # Save checkpoint if domain still active with pending URLs
+            checkpoint_id = None
+            frontier_size = 0
+            if status == "active":
+                pending = self._domain_pending_urls.get(
+                    canonical_domain, []
+                ) or self._domain_pending_urls.get(domain, [])
+                if pending:
+                    try:
+                        import redis
+
+                        redis_client = redis.from_url(get_redis_url(), socket_connect_timeout=2)
+
+                        run_id_str = str(self.crawl_run_id) if self.crawl_run_id else "unknown"
+                        checkpoint_id = save_checkpoint(
+                            canonical_domain, run_id_str, pending, redis_client
+                        )
+                        frontier_size = len(pending)
+                        self.logger.info(
+                            f"Saved checkpoint for {domain}: {checkpoint_id} ({frontier_size} URLs)"
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to save checkpoint for {domain}: {e}")
+
+            # Release claim with retries
+            released = False
+            for attempt in range(3):
+                try:
+                    updates: dict[str, Any] = {
+                        "pages_crawled_delta": pages_crawled,
+                        "pages_discovered_delta": pages_crawled + stats.get("links_discovered", 0),
+                        "images_found_delta": images_found,
+                        "images_stored_delta": images_stored,
+                        "total_error_count_delta": errors,
+                        "consecutive_error_count": 0 if pages_crawled > 0 else errors,
+                        "status": status,
+                        "last_crawl_run_id": (
+                            str(self.crawl_run_id) if self.crawl_run_id else None
+                        ),
+                    }
+                    if checkpoint_id:
+                        updates["frontier_checkpoint_id"] = checkpoint_id
+                        updates["frontier_size"] = frontier_size
+
+                    success = release_claim(
+                        domain_id=domain_id,
+                        worker_id=self.worker_id,
+                        expected_version=version,
+                        **updates,
+                    )
+
+                    if success:
+                        released = True
+                        self.logger.debug(f"Released claim for {domain} (status: {status})")
+                        break
+                    else:
+                        # Version conflict - refresh version and retry
+                        self.logger.warning(
+                            f"Version conflict releasing {domain}, retry {attempt + 1}"
+                        )
+                        version += 1
+                        with self._claimed_domains_lock:
+                            if domain_id in self._claimed_domains:
+                                self._claimed_domains[domain_id]["version"] = version
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed to release claim for {domain} (attempt {attempt + 1}): {e}"
+                    )
+
+            if not released:
+                self.logger.error(f"Could not release claim for {domain} after 3 attempts")
+
+        self.logger.info("Domain claim release complete")
 
     def _log_crawl_entry(
         self,

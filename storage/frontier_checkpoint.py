@@ -44,6 +44,10 @@ def save_checkpoint(
     checkpoint_id = f"{domain}:{run_id}"
     key = f"frontier:{checkpoint_id}"
 
+    if not urls:
+        logger.debug(f"No URLs to save for checkpoint {checkpoint_id}")
+        return checkpoint_id
+
     try:
         pipeline = redis_client.pipeline()
 

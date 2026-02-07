@@ -57,7 +57,7 @@ class TestSaveCheckpoint:
         mock_pipeline.expire.assert_called_once_with("frontier:example.com:run-123", 3600)
 
     def test_save_checkpoint_empty_urls(self):
-        """Empty URL list creates checkpoint with no members."""
+        """Empty URL list returns checkpoint ID without touching Redis."""
         mock_redis = MagicMock()
         mock_pipeline = MagicMock()
         mock_redis.pipeline.return_value = mock_pipeline
@@ -65,10 +65,10 @@ class TestSaveCheckpoint:
         checkpoint_id = save_checkpoint("example.com", "run-123", [], mock_redis)
 
         assert checkpoint_id == "example.com:run-123"
-        # No zadd calls for empty list
+        # Early return: no pipeline operations for empty list
         mock_pipeline.zadd.assert_not_called()
-        # But expire should still be set
-        mock_pipeline.expire.assert_called_once()
+        mock_pipeline.expire.assert_not_called()
+        mock_pipeline.execute.assert_not_called()
 
     def test_save_checkpoint_skips_invalid_entries(self):
         """Entries without 'url' key are skipped."""

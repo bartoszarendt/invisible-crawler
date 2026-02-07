@@ -57,6 +57,10 @@ DEFAULT_DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS = False
 DEFAULT_ENABLE_PER_DOMAIN_BUDGET = False
 DEFAULT_MAX_PAGES_PER_RUN = 1000
 
+# Smart scheduling feature flags (Phase C)
+DEFAULT_ENABLE_SMART_SCHEDULING = False
+DEFAULT_ENABLE_CLAIM_PROTOCOL = False
+
 ALLOWED_CRAWL_PROFILES = {"conservative", "broad"}
 
 
@@ -305,3 +309,35 @@ def get_default_max_pages_per_run() -> int:
     Default: 1000
     """
     return get_int_env("MAX_PAGES_PER_RUN", DEFAULT_MAX_PAGES_PER_RUN)
+
+
+def get_enable_smart_scheduling() -> bool:
+    """Return whether smart scheduling is enabled (Phase C).
+
+    When enabled:
+    - Spider queries domains table for crawl candidates instead of reading seeds
+    - Candidates selected by priority score (high-yield domains first)
+    - Active domains prioritized over pending (resume support)
+
+    Default: False (use seed-driven scheduling for backward compatibility)
+
+    WARNING: Must be deployed to ALL workers atomically. Cannot coexist with
+    Phase A/B workers.
+    """
+    return get_bool_env("ENABLE_SMART_SCHEDULING", DEFAULT_ENABLE_SMART_SCHEDULING)
+
+
+def get_enable_claim_protocol() -> bool:
+    """Return whether domain claim protocol is enabled (Phase C).
+
+    When enabled:
+    - Workers claim domains before crawling (30-minute lease)
+    - Prevents duplicate work in multi-worker deployments
+    - Uses FOR UPDATE SKIP LOCKED for atomic claim acquisition
+    - Includes heartbeat renewal (every 10 minutes)
+
+    Default: False (for backward compatibility)
+
+    Must be enabled together with ENABLE_SMART_SCHEDULING for Phase C.
+    """
+    return get_bool_env("ENABLE_CLAIM_PROTOCOL", DEFAULT_ENABLE_CLAIM_PROTOCOL)

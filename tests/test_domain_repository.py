@@ -140,6 +140,16 @@ class TestGetDomain:
             "2026-01-01",
             "file.txt",
             50,
+            "checkpoint-123",  # frontier_checkpoint_id
+            100,  # priority_score
+            "worker-1",  # claimed_by
+            None,  # claim_expires_at
+            200,  # pages_discovered
+            5,  # total_error_count
+            0,  # consecutive_error_count
+            None,  # block_reason
+            10,  # frontier_size
+            3,  # version
         )
         mock_get_cursor.return_value.__enter__.return_value = mock_cursor
 
@@ -152,6 +162,9 @@ class TestGetDomain:
         assert result["images_found"] == 500
         assert result["images_stored"] == 250
         assert result["image_yield_rate"] == 2.5
+        assert result["frontier_checkpoint_id"] == "checkpoint-123"
+        assert result["priority_score"] == 100
+        assert result["claimed_by"] == "worker-1"
 
     @patch("storage.domain_repository.get_cursor")
     def test_get_nonexistent_domain(self, mock_get_cursor):
@@ -177,21 +190,33 @@ class TestGetDomain:
 class TestBackfillDomainsFromCrawlLog:
     """Test backfill operations."""
 
+    @patch("storage.domain_repository.canonicalize_domain")
     @patch("storage.domain_repository.get_cursor")
-    def test_backfill_creates_domains(self, mock_get_cursor):
+    def test_backfill_creates_domains(self, mock_get_cursor, mock_canonicalize):
         """Test backfill creates domains from crawl_log."""
         mock_cursor = MagicMock()
-        # First call: INSERT returns rowcount
-        # Second call: UPDATE returns rowcount
-        mock_cursor.rowcount = 10
-        mock_cursor.fetchone.return_value = None
+        mock_cursor.rowcount = 1  # Individual upsert/update rowcount
+
+        # First fetchall: crawl_log rows (domain, total, pages_ok, images, errors, first, last)
+        crawl_rows = [
+            ("example.com", 5, 4, 10, 1, "2026-01-01", "2026-01-05"),
+            ("www.example.com", 3, 3, 5, 0, "2026-01-02", "2026-01-04"),
+        ]
+        # Second fetchall: provenance rows (source_domain, image_count)
+        prov_rows = [
+            ("example.com", 8),
+        ]
+        mock_cursor.fetchall.side_effect = [crawl_rows, prov_rows]
         mock_get_cursor.return_value.__enter__.return_value = mock_cursor
+
+        # Both raw domains canonicalize to the same key
+        mock_canonicalize.return_value = "example.com"
 
         result = backfill_domains_from_crawl_log()
 
-        assert result["domains_created"] == 10
-        assert result["images_stored_updated"] == 10
-        assert mock_cursor.execute.call_count == 2
+        # Two raw domains collapsed into 1 canonical domain
+        assert result["domains_created"] == 1
+        assert result["images_stored_updated"] == 1
 
     @patch("storage.domain_repository.get_cursor")
     def test_backfill_raises_on_error(self, mock_get_cursor):
