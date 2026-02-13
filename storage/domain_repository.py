@@ -240,14 +240,17 @@ def backfill_domains_from_crawl_log() -> dict[str, int]:
                     canon = canonicalize_domain(raw_domain)
                 except Exception:
                     canon = raw_domain.lower().removeprefix("www.")
-                entry = canonical_agg.setdefault(canon, {
-                    "pages_discovered": 0,
-                    "pages_crawled": 0,
-                    "images_found": 0,
-                    "error_count": 0,
-                    "first_seen": first,
-                    "last_seen": last,
-                })
+                entry = canonical_agg.setdefault(
+                    canon,
+                    {
+                        "pages_discovered": 0,
+                        "pages_crawled": 0,
+                        "images_found": 0,
+                        "error_count": 0,
+                        "first_seen": first,
+                        "last_seen": last,
+                    },
+                )
                 entry["pages_discovered"] += total
                 entry["pages_crawled"] += pages_ok
                 entry["images_found"] += imgs
@@ -260,9 +263,7 @@ def backfill_domains_from_crawl_log() -> dict[str, int]:
             # Upsert aggregated rows
             for canon, agg in canonical_agg.items():
                 status = (
-                    "blocked"
-                    if agg["error_count"] > agg["pages_discovered"] * 0.5
-                    else "exhausted"
+                    "blocked" if agg["error_count"] > agg["pages_discovered"] * 0.5 else "exhausted"
                 )
                 cur.execute(
                     """
@@ -278,10 +279,14 @@ def backfill_domains_from_crawl_log() -> dict[str, int]:
                         last_crawled_at = EXCLUDED.last_crawled_at
                     """,
                     (
-                        canon, status,
-                        agg["pages_discovered"], agg["pages_crawled"],
-                        agg["images_found"], agg["error_count"],
-                        agg["first_seen"], agg["last_seen"],
+                        canon,
+                        status,
+                        agg["pages_discovered"],
+                        agg["pages_crawled"],
+                        agg["images_found"],
+                        agg["error_count"],
+                        agg["first_seen"],
+                        agg["last_seen"],
                     ),
                 )
             stats["domains_created"] = len(canonical_agg)
@@ -655,6 +660,7 @@ def release_claim(
             set_clauses = [
                 "claimed_by = NULL",
                 "claim_expires_at = NULL",
+                "last_crawled_at = CURRENT_TIMESTAMP",  # Always update on claim release
             ]
             if not status_transitioned:
                 set_clauses.append("version = version + 1")

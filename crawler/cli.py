@@ -437,19 +437,19 @@ def domain_info_command(args: argparse.Namespace) -> int:
         print()
         print(f"Total Errors: {info.get('total_error_count', 0)}")
         print(f"Consecutive Errors: {info.get('consecutive_error_count', 0)}")
-        if info.get('block_reason'):
+        if info.get("block_reason"):
             print(f"Block Reason: {info['block_reason']}")
         print()
         print(f"First Seen: {info['first_seen_at']}")
         print(f"Last Crawled: {info['last_crawled_at'] or 'Never'}")
         print(f"Priority Score: {info.get('priority_score', 'N/A')}")
         print()
-        if info.get('frontier_checkpoint_id'):
+        if info.get("frontier_checkpoint_id"):
             print(f"Frontier Checkpoint: {info['frontier_checkpoint_id']}")
             print(f"Frontier Size: {info.get('frontier_size', 0)} URLs")
-        if info.get('claimed_by'):
+        if info.get("claimed_by"):
             print(f"Claimed By: {info['claimed_by']}")
-            expires_at = info.get('claim_expires_at')
+            expires_at = info.get("claim_expires_at")
             if expires_at:
                 try:
                     print(f"Claim Expires: {expires_at.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -588,7 +588,7 @@ def release_stuck_claims_command(args: argparse.Namespace) -> int:
 
         elif all_active:
             # Global: release all active claims
-            total_count = sum(c['count'] for c in active_claims)
+            total_count = sum(c["count"] for c in active_claims)
             print(f"\nWould release {total_count} active claims across all workers")
             print("\nWARNING: This will release ALL active claims, including from running workers!")
 
@@ -648,7 +648,11 @@ def cleanup_stale_runs_command(args: argparse.Namespace) -> int:
     dry_run = args.dry_run
 
     try:
+        from datetime import datetime, timedelta
+
         from storage.db import get_cursor
+
+        threshold_timestamp = datetime.now() - timedelta(minutes=older_than_minutes)
 
         with get_cursor() as cur:
             # Find stale runs: no recent activity and still 'running'
@@ -665,10 +669,10 @@ def cleanup_stale_runs_command(args: argparse.Namespace) -> int:
                 SELECT id, started_at, last_activity,
                        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_activity))/60 AS minutes_idle
                 FROM run_activity
-                WHERE last_activity < CURRENT_TIMESTAMP - INTERVAL '%s minutes'
+                WHERE last_activity < %s
                 ORDER BY last_activity ASC
                 """,
-                (older_than_minutes,),
+                (threshold_timestamp,),
             )
 
             stale_runs = cur.fetchall()
@@ -786,6 +790,45 @@ def domain_reset_command(args: argparse.Namespace) -> int:
 
     except Exception as e:
         logger.error(f"Failed to reset domain: {e}")
+        return 1
+
+
+def cleanup_fingerprints_command(args: argparse.Namespace) -> int:
+    """Clean up old URL fingerprints from persistent dupefilter.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
+    dry_run = args.dry_run
+    redis_url = args.redis_url or get_redis_url()
+
+    try:
+        import redis
+
+        client: Any = redis.from_url(redis_url)  # type: ignore[no-untyped-call]
+        key = "dupefilter:fingerprints"
+
+        if not client.exists(key):
+            print("\nNo fingerprints found")
+            return 0
+
+        all_fps = client.smembers(key)
+
+        print(f"\nTotal fingerprints: {len(all_fps)}")
+
+        if dry_run:
+            print(f"DRY RUN: Would delete {len(all_fps)} fingerprints")
+            return 0
+
+        count = client.srem(key, *all_fps)
+        print(f"Deleted {count} fingerprints")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to cleanup fingerprints: {e}")
         return 1
 
 
@@ -974,6 +1017,23 @@ def main() -> int:
         help="Skip confirmation prompt",
     )
     reset_parser.set_defaults(func=domain_reset_command)
+
+    # cleanup-fingerprints command
+    cleanup_fp_parser = subparsers.add_parser(
+        "cleanup-fingerprints",
+        help="Clear all URL fingerprints from persistent dupefilter (Redis)",
+    )
+    cleanup_fp_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview without deleting",
+    )
+    cleanup_fp_parser.add_argument(
+        "--redis-url",
+        type=str,
+        help="Redis connection URL (default: from REDIS_URL env var)",
+    )
+    cleanup_fp_parser.set_defaults(func=cleanup_fingerprints_command)
 
     args = parser.parse_args()
 

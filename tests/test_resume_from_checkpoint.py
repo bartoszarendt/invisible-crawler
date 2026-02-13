@@ -4,6 +4,7 @@ Tests that verify domains can resume crawling from saved checkpoints,
 including checkpoint loading, clearing, and graceful fallback behavior.
 """
 
+from collections import deque
 from unittest.mock import patch
 
 import pytest
@@ -119,17 +120,19 @@ class TestCheckpointSaveOnClose:
                 spider.max_pages_per_run = 5
                 spider.crawl_run_id = None  # Skip crawl run DB updates
                 spider._domain_pages_crawled = {"example.com": 5}  # Budget reached
-                spider._domain_pending_urls = {
-                    "example.com": [
-                        {"url": "https://example.com/page1", "depth": 1},
-                        {"url": "https://example.com/page2", "depth": 2},
-                    ]
+                spider._domain_frontier_queue = {
+                    "example.com": deque(
+                        [
+                            {"url": "https://example.com/page1", "depth": 1},
+                            {"url": "https://example.com/page2", "depth": 2},
+                        ]
+                    )
                 }
                 return spider
 
     def test_no_checkpoint_without_pending_urls(self, spider_with_budget: DiscoverySpider) -> None:
         """No checkpoint saved if no pending URLs."""
-        spider_with_budget._domain_pending_urls = {"example.com": []}
+        spider_with_budget._domain_frontier_queue = {"example.com": deque()}
 
         # Should not raise exception
         spider_with_budget.closed("finished")
@@ -169,9 +172,9 @@ class TestCheckpointSaveOnClose:
             "example.com": 5,
             "other.com": 5,
         }
-        spider_with_budget._domain_pending_urls = {
-            "example.com": [{"url": "https://example.com/page1", "depth": 1}],
-            "other.com": [{"url": "https://other.com/page1", "depth": 1}],
+        spider_with_budget._domain_frontier_queue = {
+            "example.com": deque([{"url": "https://example.com/page1", "depth": 1}]),
+            "other.com": deque([{"url": "https://other.com/page1", "depth": 1}]),
         }
 
         # Should not raise exception
@@ -182,7 +185,7 @@ class TestResumeState:
     """Tests for resume state tracking."""
 
     def test_pending_urls_accumulated_correctly(self) -> None:
-        """Pending URLs are accumulated as crawl progresses."""
+        """Pending URLs are enqueued when budget is exhausted."""
         with patch("env_config.get_enable_per_domain_budget", return_value=True):
             with patch("env_config.get_enable_domain_tracking", return_value=True):
                 spider = DiscoverySpider(seeds="config/test_seeds.txt")
@@ -202,16 +205,20 @@ class TestResumeState:
                     headers={"Content-Type": "text/html"},
                 )
 
-                # Parse multiple times
-                list(spider.parse(response))
-                list(spider.parse(response))
+                # Parse 1: budget not hit (0 < 2), links YIELDED
                 list(spider.parse(response))
 
-                # Should have pending URLs tracked
-                assert "example.com" in spider._domain_pending_urls
-                pending = spider._domain_pending_urls["example.com"]
-                # Each page has 2 links, parsed 3 times = 6 pending URLs tracked
-                assert len(pending) == 6
+                # Parse 2: budget not hit (1 < 2), links YIELDED
+                list(spider.parse(response))
+
+                # Parse 3: budget EXHAUSTED (2 >= 2), links ENQUEUED
+                list(spider.parse(response))
+
+                # Only the last parse's links should be in frontier queue
+                assert "example.com" in spider._domain_frontier_queue
+                pending = spider._domain_frontier_queue["example.com"]
+                # 2 links from the 3rd parse
+                assert len(pending) == 2
 
     def test_per_domain_pages_tracked_correctly(self) -> None:
         """Pages crawled are tracked per domain."""

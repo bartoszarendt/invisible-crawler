@@ -8,6 +8,7 @@ import os
 import socket
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urljoin, urlparse
@@ -23,6 +24,7 @@ from env_config import (
     get_domain_canonicalization_strip_subdomains,
     get_domain_stats_flush_interval,
     get_enable_claim_protocol,
+    get_enable_continuous_mode,
     get_enable_domain_tracking,
     get_enable_per_domain_budget,
     get_enable_smart_scheduling,
@@ -92,6 +94,7 @@ class DiscoverySpider(Spider):
         """
         spider = super().from_crawler(crawler, *args, **kwargs)
         crawler.signals.connect(spider.spider_opened, signal=signals.spider_opened)
+        crawler.signals.connect(spider.spider_idle_handler, signal=signals.spider_idle)
         return spider
 
     def spider_opened(self, spider: Spider) -> None:
@@ -191,7 +194,10 @@ class DiscoverySpider(Spider):
         self.enable_per_domain_budget = get_enable_per_domain_budget()
         self.max_pages_per_run = get_default_max_pages_per_run()
         self._domain_pages_crawled: dict[str, int] = {}  # Pages crawled per domain this run
-        self._domain_pending_urls: dict[str, list[dict[str, Any]]] = {}
+        # True queue semantics: tracks URLs TO BE CRAWLED (not all discovered)
+        # Uses deque for O(1) pop from left
+        self._domain_frontier_queue: dict[str, deque[dict[str, Any]]] = {}
+        self._frontier_max_size = 1000  # Cap to prevent memory growth
         # Smart scheduling and claim protocol (Phase C)
         self.enable_smart_scheduling = get_enable_smart_scheduling()
         self.enable_claim_protocol = get_enable_claim_protocol()
@@ -203,6 +209,8 @@ class DiscoverySpider(Spider):
         # Mid-crawl state flushing (Phase C resilience)
         self.flush_interval = get_domain_stats_flush_interval()
         self._domain_flushed_stats: dict[str, dict[str, int]] = {}  # Track flushed deltas
+        # Continuous mode: keep worker alive when no domains available
+        self.enable_continuous_mode = get_enable_continuous_mode()
 
         # Phase C validation: Claim protocol requires smart scheduling
         if self.enable_claim_protocol and not self.enable_smart_scheduling:
@@ -222,6 +230,162 @@ class DiscoverySpider(Spider):
             self.logger.info(
                 f"Phase C enabled: smart scheduling + claim protocol (worker: {self.worker_id})"
             )
+
+    def enqueue_url(self, domain: str, url: str, depth: int) -> bool:
+        """Add URL to domain's frontier queue with FIFO semantics.
+
+        Args:
+            domain: Domain key for the queue
+            url: URL to enqueue
+            depth: Depth level for priority
+
+        Returns:
+            True if URL was enqueued, False if queue is at capacity
+        """
+        if domain not in self._domain_frontier_queue:
+            self._domain_frontier_queue[domain] = deque()
+
+        queue = self._domain_frontier_queue[domain]
+        if len(queue) >= self._frontier_max_size:
+            self.logger.debug(f"Frontier queue full for {domain}, dropping URL: {url}")
+            return False
+
+        queue.append({"url": url, "depth": depth})
+        return True
+
+    def dequeue_url(self, domain: str) -> dict[str, Any] | None:
+        """Remove and return next URL from domain's frontier queue.
+
+        Args:
+            domain: Domain key for the queue
+
+        Returns:
+            Dict with url and depth, or None if queue is empty
+        """
+        if domain not in self._domain_frontier_queue:
+            return None
+
+        queue = self._domain_frontier_queue[domain]
+        if not queue:
+            return None
+
+        return queue.popleft()
+
+    def get_frontier_size(self, domain: str) -> int:
+        """Get current queue size for a domain.
+
+        Args:
+            domain: Domain key
+
+        Returns:
+            Number of URLs pending in queue
+        """
+        if domain not in self._domain_frontier_queue:
+            return 0
+        return len(self._domain_frontier_queue[domain])
+
+    def _compute_domain_status(self, domain: str) -> str:
+        """Compute domain status based on true queue state.
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            Status: "active" if queue has pending URLs, "exhausted" otherwise
+        """
+        queue_size = self.get_frontier_size(domain)
+        if queue_size > 0:
+            return "active"
+        return "exhausted"
+
+    def spider_idle_handler(self) -> None:
+        """Called when spider has no more requests to process.
+
+        For Phase C with continuous mode enabled, attempts to claim
+        more domains when the queue is empty to prevent worker churn.
+        """
+        from scrapy.exceptions import DontCloseSpider
+
+        if not self.enable_smart_scheduling or not self.enable_claim_protocol:
+            return
+
+        if not self.enable_continuous_mode:
+            return
+
+            self.logger.debug("Spider idle - attempting to claim more domains")
+        try:
+            new_requests = list(self._refill_claims())
+            if new_requests:
+                self.logger.info(f"Refilled {len(new_requests)} requests from new domain claims")
+                for req in new_requests:
+                    self.crawler.engine.crawl(req, self)  # type: ignore[union-attr,call-arg]
+                raise DontCloseSpider("Refilled with new domain claims")
+        except Exception as e:
+            self.logger.warning(f"Failed to refill claims: {e}")
+
+    def _refill_claims(self) -> Any:
+        """Query and claim more domains when current work is done.
+
+        Yields:
+            Request objects for newly claimed domains.
+        """
+        if not self.enable_smart_scheduling or not self.enable_claim_protocol:
+            return
+
+        try:
+            claimed = claim_domains(self.worker_id, batch_size=10)
+            if not claimed:
+                self.logger.info("No domains available to claim in refill")
+                return
+
+            self.logger.info(f"Refill claimed {len(claimed)} domains")
+
+            for domain_row in claimed:
+                domain_id = domain_row["id"]
+                domain = domain_row["domain"]
+                version = domain_row["version"]
+                checkpoint_id = domain_row.get("frontier_checkpoint_id")
+
+                with self._claimed_domains_lock:
+                    self._claimed_domains[domain_id] = {
+                        "domain": domain,
+                        "version": version,
+                    }
+
+                if checkpoint_id:
+                    self.logger.info(f"Resuming {domain} from checkpoint: {checkpoint_id}")
+                    try:
+                        redis_client = _redis_from_url(get_redis_url(), socket_timeout=2)
+                        checkpoint_urls = load_checkpoint(checkpoint_id, redis_client)
+                        if checkpoint_urls:
+                            for entry in checkpoint_urls:
+                                yield Request(
+                                    url=entry["url"],
+                                    callback=self.parse,
+                                    errback=self.handle_error,
+                                    meta={
+                                        "depth": entry["depth"],
+                                        "domain": domain,
+                                        "domain_id": domain_id,
+                                    },
+                                )
+                            delete_checkpoint(checkpoint_id, redis_client)
+                            clear_frontier_checkpoint(domain)
+                            continue
+                        else:
+                            clear_frontier_checkpoint(domain)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to load checkpoint for {domain}: {e}")
+
+                yield Request(
+                    url=f"https://{domain}",
+                    callback=self.parse,
+                    errback=self.handle_error,
+                    meta={"depth": 0, "domain": domain, "domain_id": domain_id},
+                )
+
+        except Exception as e:
+            self.logger.error(f"Refill claims failed: {e}")
 
     def start_requests(self) -> Any:
         """Generate initial requests from seed domains.
@@ -659,12 +823,12 @@ class DiscoverySpider(Spider):
                 self._domain_pages_crawled.get(current_domain, 0) + 1
             )
 
-            # Always track URLs for potential checkpoint
+        # Enqueue links to frontier queue if budget is exhausted
+        # These URLs will be saved to checkpoint if crawl ends
+        if not should_yield_links and extracted_links:
             for next_url in extracted_links:
                 next_depth = current_depth + 1
-                self._domain_pending_urls.setdefault(current_domain, []).append(
-                    {"url": next_url, "depth": next_depth}
-                )
+                self.enqueue_url(current_domain, next_url, next_depth)
 
         # Yield links if budget permits
         if should_yield_links:
@@ -1022,36 +1186,31 @@ class DiscoverySpider(Spider):
                 self.logger.warning(f"Failed to update crawl run: {e}")
 
         # Phase B: Save frontier checkpoints for domains with pending URLs
-        if (
-            self.enable_per_domain_budget
-            and self.enable_domain_tracking
-            and self._domain_pending_urls
-        ):
+        # Only save if domain hit its budget limit
+        if self.enable_per_domain_budget and self.enable_domain_tracking:
             try:
                 redis_client = _redis_from_url(get_redis_url(), socket_timeout=2)
-
                 run_id_str = str(self.crawl_run_id) if self.crawl_run_id else "unknown"
 
-                for domain, pending_urls in self._domain_pending_urls.items():
-                    # Only save checkpoint if domain actually hit its budget
-                    # (and budget is not unlimited - max_pages_per_run=0 means unlimited)
+                for domain, queue in self._domain_frontier_queue.items():
+                    queue_size = len(queue)
+                    if queue_size == 0:
+                        continue
+
+                    # Only save checkpoint if domain hit its budget
                     pages_crawled = self._domain_pages_crawled.get(domain, 0)
-                    if (
-                        pending_urls
-                        and self.max_pages_per_run > 0
-                        and pages_crawled >= self.max_pages_per_run
-                    ):
+                    if self.max_pages_per_run > 0 and pages_crawled >= self.max_pages_per_run:
                         try:
                             canonical_domain = canonicalize_domain(domain, self.strip_subdomains)
+                            # Convert deque to list for checkpoint
+                            pending_urls = list(queue)
                             checkpoint_id = save_checkpoint(
                                 canonical_domain, run_id_str, pending_urls, redis_client
                             )
-                            update_frontier_checkpoint(
-                                canonical_domain, checkpoint_id, len(pending_urls)
-                            )
+                            update_frontier_checkpoint(canonical_domain, checkpoint_id, queue_size)
                             self.logger.info(
                                 f"Saved frontier checkpoint for {domain}: "
-                                f"{len(pending_urls)} URLs (checkpoint: {checkpoint_id})"
+                                f"{queue_size} URLs (checkpoint: {checkpoint_id})"
                             )
                         except Exception as e:
                             self.logger.warning(f"Failed to save checkpoint for {domain}: {e}")
@@ -1073,15 +1232,18 @@ class DiscoverySpider(Spider):
                 for domain, stats in domains_to_update.items():
                     # Get flushed stats to compute remainders
                     flushed = self._domain_flushed_stats.get(
-                        domain,
-                        {"pages": 0, "images_found": 0, "errors": 0, "links_discovered": 0}
+                        domain, {"pages": 0, "images_found": 0, "errors": 0, "links_discovered": 0}
                     )
 
                     # Compute remainder deltas (avoid double-counting after mid-crawl flush)
                     pages_delta = max(0, stats.get("pages", 0) - flushed.get("pages", 0))
-                    images_delta = max(0, stats.get("images_found", 0) - flushed.get("images_found", 0))
+                    images_delta = max(
+                        0, stats.get("images_found", 0) - flushed.get("images_found", 0)
+                    )
                     errors_delta = max(0, stats.get("errors", 0) - flushed.get("errors", 0))
-                    links_delta = max(0, stats.get("links_discovered", 0) - flushed.get("links_discovered", 0))
+                    links_delta = max(
+                        0, stats.get("links_discovered", 0) - flushed.get("links_discovered", 0)
+                    )
 
                     # Determine status based on crawl outcome using canonicalized blocked set
                     if domain in self._blocked_domains_canonical:
@@ -1102,9 +1264,7 @@ class DiscoverySpider(Spider):
                         images_found_delta=images_delta,
                         images_stored_delta=domain_images_stored.get(domain, 0),
                         total_error_count_delta=errors_delta,
-                        consecutive_error_count=(
-                            0 if pages_delta > 0 else errors_delta
-                        ),
+                        consecutive_error_count=(0 if pages_delta > 0 else errors_delta),
                         status=status,
                         last_crawl_run_id=str(self.crawl_run_id) if self.crawl_run_id else None,
                     )
@@ -1197,33 +1357,35 @@ class DiscoverySpider(Spider):
             images_found = max(0, stats.get("images_found", 0) - flushed.get("images_found", 0))
             images_stored = domain_images_stored.get(canonical_domain, 0)
             errors = max(0, stats.get("errors", 0) - flushed.get("errors", 0))
-            links_discovered = max(0, stats.get("links_discovered", 0) - flushed.get("links_discovered", 0))
+            links_discovered = max(
+                0, stats.get("links_discovered", 0) - flushed.get("links_discovered", 0)
+            )
 
-            # Determine final status — check both canonical and raw keys for pending URLs
+            # Determine final status — use true queue state
             if canonical_domain in self._blocked_domains_canonical:
                 status = "blocked"
             else:
-                pending = self._domain_pending_urls.get(
-                    canonical_domain, []
-                ) or self._domain_pending_urls.get(domain, [])
-                status = "active" if pending else "exhausted"
+                queue_size = self.get_frontier_size(canonical_domain)
+                if queue_size == 0:
+                    queue_size = self.get_frontier_size(domain)
+                status = "active" if queue_size > 0 else "exhausted"
 
             # Save checkpoint if domain still active with pending URLs
             checkpoint_id = None
             frontier_size = 0
             if status == "active":
-                pending = self._domain_pending_urls.get(
-                    canonical_domain, []
-                ) or self._domain_pending_urls.get(domain, [])
-                if pending:
+                queue = self._domain_frontier_queue.get(
+                    canonical_domain
+                ) or self._domain_frontier_queue.get(domain)
+                if queue and len(queue) > 0:
                     try:
                         redis_client = _redis_from_url(get_redis_url(), socket_timeout=2)
-
                         run_id_str = str(self.crawl_run_id) if self.crawl_run_id else "unknown"
+                        pending = list(queue)
                         checkpoint_id = save_checkpoint(
                             canonical_domain, run_id_str, pending, redis_client
                         )
-                        frontier_size = len(pending)
+                        frontier_size = len(queue)
                         self.logger.info(
                             f"Saved checkpoint for {domain}: {checkpoint_id} ({frontier_size} URLs)"
                         )
@@ -1236,7 +1398,8 @@ class DiscoverySpider(Spider):
                 try:
                     updates: dict[str, Any] = {
                         "pages_crawled_delta": pages_crawled,
-                        "pages_discovered_delta": pages_crawled + links_discovered,  # Use remainder links
+                        "pages_discovered_delta": pages_crawled
+                        + links_discovered,  # Use remainder links
                         "images_found_delta": images_found,
                         "images_stored_delta": images_stored,
                         "total_error_count_delta": errors,
@@ -1313,7 +1476,10 @@ class DiscoverySpider(Spider):
                 domain_id: UUID | None = None
                 with self._claimed_domains_lock:
                     for did, info in self._claimed_domains.items():
-                        if canonicalize_domain(info["domain"], self.strip_subdomains) == canonical_domain:
+                        if (
+                            canonicalize_domain(info["domain"], self.strip_subdomains)
+                            == canonical_domain
+                        ):
                             domain_id = did
                             break
 

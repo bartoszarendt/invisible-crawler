@@ -11,7 +11,7 @@ InvisibleCrawler is a self-hosted, large-scale web crawler designed to discover 
 * **processor/** – image fetching, normalization, and fingerprinting logic
 * **storage/** – database schemas and Alembic migrations for PostgreSQL
 * **config/** – seed domain lists, allowlists, and blocklists
-* **tests/** – unit and integration test suites (225 collected tests; DB-backed tests require `DATABASE_URL`)
+* **tests/** – unit and integration test suites (250 collected tests; DB-backed tests require `DATABASE_URL`)
 
 ## Build & Development Commands
 
@@ -95,7 +95,7 @@ The crawler follows a pipeline architecture with clear stage boundaries:
 
 * **Unit tests**: pytest for individual components (fetcher, fingerprinter, spider parsing)
 * **Integration tests**: pytest-httpserver for mock HTTP endpoints; requires running PostgreSQL
-* **Test count**: 225 collected tests; DB-backed domain-tracking tests require `DATABASE_URL`
+* **Test count**: 250 collected tests; DB-backed domain-tracking tests require `DATABASE_URL`
 * **Fixtures**: Synthetic HTML pages in `tests/fixtures.py`
 * **Coverage target**: ≥80% for core logic
 
@@ -211,6 +211,6 @@ When structural gaps are identified, agents should:
 
 ---
 
-**Last Updated**: 2026-02-07  
+**Last Updated**: 2026-02-13  
 **Status**: Phase 2 + Domain Tracking Phases A-C implemented; Phase D (refresh mode) pending  
 **Maintainer Contact**: TBD

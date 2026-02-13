@@ -46,7 +46,9 @@ BROAD_SCRAPY_DOWNLOAD_DELAY = 0.25
 BROAD_SCRAPY_AUTOTHROTTLE_TARGET_CONCURRENCY = 4.0
 BROAD_SCRAPY_DOWNLOAD_TIMEOUT = 20
 BROAD_SCRAPY_RETRY_TIMES = 2
-DEFAULT_CRAWLER_MAX_PAGES = 100000  # Global safety ceiling; per-domain budget is the primary control
+DEFAULT_CRAWLER_MAX_PAGES = (
+    100000  # Global safety ceiling; per-domain budget is the primary control
+)
 ALLOWED_APP_ENVS = {"dev", "staging", "prod"}
 
 # Domain tracking feature flags (Phase A)
@@ -61,6 +63,9 @@ DEFAULT_MAX_PAGES_PER_RUN = 100
 DEFAULT_ENABLE_SMART_SCHEDULING = False
 DEFAULT_ENABLE_CLAIM_PROTOCOL = False
 DEFAULT_DOMAIN_STATS_FLUSH_INTERVAL_PAGES = 100  # 0 = disabled
+DEFAULT_ENABLE_CONTINUOUS_MODE = False  # Keep worker alive when no domains available
+DEFAULT_ENABLE_PERSISTENT_DUPEFILTER = False  # Persist URL fingerprints to Redis
+DEFAULT_ENABLE_IMMUTABLE_ASSETS = False  # Use image_assets table instead of provenance
 
 ALLOWED_CRAWL_PROFILES = {"conservative", "broad"}
 
@@ -355,4 +360,39 @@ def get_domain_stats_flush_interval() -> int:
 
     Default: 100 pages (about 1 flush per minute per domain at 2 pages/sec)
     """
-    return get_int_env("DOMAIN_STATS_FLUSH_INTERVAL_PAGES", DEFAULT_DOMAIN_STATS_FLUSH_INTERVAL_PAGES)
+    return get_int_env(
+        "DOMAIN_STATS_FLUSH_INTERVAL_PAGES", DEFAULT_DOMAIN_STATS_FLUSH_INTERVAL_PAGES
+    )
+
+
+def get_enable_continuous_mode() -> bool:
+    """Return whether continuous mode is enabled.
+
+    When enabled, the spider will not exit when no domains are available
+    to claim. Instead, it will periodically poll for new work.
+
+    Default: False (spider exits when queue is empty)
+    """
+    return get_bool_env("ENABLE_CONTINUOUS_MODE", DEFAULT_ENABLE_CONTINUOUS_MODE)
+
+
+def get_enable_persistent_dupefilter() -> bool:
+    """Return whether persistent dupefilter is enabled.
+
+    When enabled, URL fingerprints are persisted to Redis to survive restarts.
+
+    Default: False (use in-memory dupefilter)
+    """
+    return get_bool_env("ENABLE_PERSISTENT_DUPEFILTER", DEFAULT_ENABLE_PERSISTENT_DUPEFILTER)
+
+
+def get_enable_immutable_assets() -> bool:
+    """Return whether immutable assets mode is enabled.
+
+    When enabled, uses image_assets + image_observations tables for
+    storing image data with immutable asset records and mutable observations.
+    This enables future InvisibleID detection capabilities.
+
+    Default: False (use existing provenance table)
+    """
+    return get_bool_env("ENABLE_IMMUTABLE_ASSETS", DEFAULT_ENABLE_IMMUTABLE_ASSETS)

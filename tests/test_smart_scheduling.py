@@ -156,9 +156,7 @@ class TestClaimRelease:
                 "example.com": {"pages": 10, "images_found": 5, "errors": 0, "links_discovered": 3}
             }
             # Mock DB-dependent method for computing images_stored
-            spider._compute_domain_images_stored = MagicMock(
-                return_value={"example.com": 3}
-            )
+            spider._compute_domain_images_stored = MagicMock(return_value={"example.com": 3})
             return spider
 
     def test_releases_claims_on_close(self, spider):
@@ -203,9 +201,7 @@ class TestClaimRelease:
         domain_id_1 = str(uuid.uuid4())
         str(uuid.uuid4())
 
-        spider._claimed_domains = {
-            domain_id_1: {"domain": "claimed.com", "version": 1}
-        }
+        spider._claimed_domains = {domain_id_1: {"domain": "claimed.com", "version": 1}}
         spider._domain_stats = {
             "claimed.com": {"pages": 10, "images_found": 5, "errors": 0, "links_discovered": 3},
             "unclaimed.com": {"pages": 8, "images_found": 2, "errors": 1, "links_discovered": 4},
@@ -219,9 +215,7 @@ class TestClaimRelease:
                 "crawler.spiders.discovery_spider.release_claim",
                 return_value=True,
             ),
-            patch(
-                "crawler.spiders.discovery_spider.update_domain_stats"
-            ) as mock_update_stats,
+            patch("crawler.spiders.discovery_spider.update_domain_stats") as mock_update_stats,
         ):
             spider.closed("finished")
 
@@ -239,7 +233,7 @@ class TestClaimRelease:
         spider._domain_stats = {
             "example.com": {"pages": 100, "images_found": 50, "errors": 0, "links_discovered": 0}
         }
-        spider._domain_pending_urls = {}  # No pending URLs = exhausted
+        spider._domain_frontier_queue = {}  # No pending URLs = exhausted
         spider._compute_domain_images_stored = MagicMock(return_value={"example.com": 40})
 
         with (
@@ -247,9 +241,7 @@ class TestClaimRelease:
                 "crawler.spiders.discovery_spider.release_claim",
                 return_value=True,
             ) as mock_release,
-            patch(
-                "crawler.spiders.discovery_spider.update_domain_stats"
-            ) as mock_update_stats,
+            patch("crawler.spiders.discovery_spider.update_domain_stats") as mock_update_stats,
         ):
             spider.closed("finished")
 

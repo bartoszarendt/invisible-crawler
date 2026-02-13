@@ -6,6 +6,8 @@
 **Scope:** Schema additions, spider changes, scheduling logic, resume support, concurrency safety  
 **Review Findings:** Critical gaps identified in concurrency, frontier scale, canonicalization, and migration hardening
 
+> Implementation note (2026-02-13): Sections labeled as gaps/proposals are the pre-Phase-A baseline used to drive this design. Current runtime behavior and defaults are documented in `IMPLEMENTATION.md`.
+
 ---
 
 ## 1. Problem Statement
@@ -925,7 +927,7 @@ ON CONFLICT (domain) DO NOTHING;  -- Don't overwrite if already exists from seed
 1. Add per-domain counters to spider: `self._domain_pages_crawled: dict[str, int]`
 2. Check per-domain budget before following links
 3. Save frontier checkpoint when domain budget exhausted
-4. **Feature flag:** `ENABLE_PER_DOMAIN_BUDGET=true` (default: false initially)
+4. **Feature flag:** `ENABLE_PER_DOMAIN_BUDGET=true` (default in current code: true)
 
 **Mixed-Version Behavior:**
 - Old workers continue using global `max_pages`
@@ -1025,8 +1027,8 @@ The 2-week soak periods between phases are conservative operational guidance for
 
 **Step 1: Deploy all code with conservative defaults**
 - Ship Phases A through D in a single code deployment
-- Default flags: `ENABLE_DOMAIN_TRACKING=true`, all others `false`
-- This means only Phase A (passive tracking) is active
+- Default flags in current code: `ENABLE_DOMAIN_TRACKING=true`, `ENABLE_PER_DOMAIN_BUDGET=true`, `ENABLE_SMART_SCHEDULING=false`, `ENABLE_CLAIM_PROTOCOL=false`
+- This means Phase A and Phase B are active by default; Phase C remains opt-in
 
 **Step 2: Activate Phase A and run a verification crawl**
 ```bash
@@ -1079,7 +1081,7 @@ scrapy crawl discovery -a max_pages=500 &
 psql $DATABASE_URL -c "
   SELECT domain, COUNT(*) FROM crawl_log
   WHERE crawled_at > NOW() - INTERVAL '1 hour'
-  GROUP BY domain, url
+  GROUP BY domain, page_url
   HAVING COUNT(*) > 1;
 "
 # Should return 0 rows (no duplicates)

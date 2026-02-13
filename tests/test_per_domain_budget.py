@@ -44,7 +44,7 @@ class TestPerDomainBudget:
         assert spider_with_budget.enable_per_domain_budget is True
         assert spider_with_budget.max_pages_per_run == 5
         assert spider_with_budget._domain_pages_crawled == {}
-        assert spider_with_budget._domain_pending_urls == {}
+        assert spider_with_budget._domain_frontier_queue == {}
 
     def test_per_domain_budget_disabled_no_tracking(
         self, spider_without_budget: DiscoverySpider
@@ -52,7 +52,7 @@ class TestPerDomainBudget:
         """Disabled mode doesn't use per-domain tracking."""
         assert spider_without_budget.enable_per_domain_budget is False
         assert spider_without_budget._domain_pages_crawled == {}
-        assert spider_without_budget._domain_pending_urls == {}
+        assert spider_without_budget._domain_frontier_queue == {}
 
     def test_parse_tracks_per_domain_page_count(self, spider_with_budget: DiscoverySpider) -> None:
         """Parse tracks pages crawled per domain."""
@@ -124,24 +124,39 @@ class TestPerDomainBudget:
     def test_pending_urls_tracked_when_budget_reached(
         self, spider_with_budget: DiscoverySpider
     ) -> None:
-        """Pending URLs are tracked when budget is reached mid-parse."""
+        """Pending URLs are tracked when budget is exhausted after first page."""
         spider_with_budget.max_pages_per_run = 1
 
-        request = Request(url="https://example.com/", meta={"domain": "example.com", "depth": 0})
-        response = HtmlResponse(
+        # First request: budget not yet hit (0 < 1), so links are YIELDED
+        request1 = Request(url="https://example.com/", meta={"domain": "example.com", "depth": 0})
+        response1 = HtmlResponse(
             url="https://example.com/",
-            request=request,
+            request=request1,
             body=b"<html><body><a href='/page1'>Link</a><a href='/page2'>Link2</a></body></html>",
             headers={"Content-Type": "text/html"},
         )
+        list(spider_with_budget.parse(response1))
 
-        list(spider_with_budget.parse(response))
+        # After first page, no URLs should be in frontier (they were yielded)
+        assert "example.com" not in spider_with_budget._domain_frontier_queue
 
-        # After first page, budget is reached, but URLs should be tracked
-        assert "example.com" in spider_with_budget._domain_pending_urls
-        pending = spider_with_budget._domain_pending_urls["example.com"]
-        assert len(pending) == 2
-        assert all("url" in entry and "depth" in entry for entry in pending)
+        # Second request: budget now hit (1 >= 1), links are ENQUEUED
+        request2 = Request(
+            url="https://example.com/page1", meta={"domain": "example.com", "depth": 1}
+        )
+        response2 = HtmlResponse(
+            url="https://example.com/page1",
+            request=request2,
+            body=b"<html><body><a href='/page3'>Link3</a></body></html>",
+            headers={"Content-Type": "text/html"},
+        )
+        list(spider_with_budget.parse(response2))
+
+        # Now budget exhausted, URLs should be enqueued to frontier for checkpoint
+        assert "example.com" in spider_with_budget._domain_frontier_queue
+        queue = spider_with_budget._domain_frontier_queue["example.com"]
+        assert len(queue) == 1
+        assert queue[0]["url"] == "https://example.com/page3"
 
     def test_global_budget_used_when_per_domain_disabled(
         self, spider_without_budget: DiscoverySpider
@@ -296,6 +311,6 @@ class TestPerDomainBudgetWithRealHTML:
         # Third parse should track pending but not yield link requests
         assert len(link_requests_3) == 0
 
-        # But pending URLs should be tracked
-        assert "example.com" in spider._domain_pending_urls
-        assert len(spider._domain_pending_urls["example.com"]) > 0
+        # But pending URLs should be tracked in frontier queue
+        assert "example.com" in spider._domain_frontier_queue
+        assert len(spider._domain_frontier_queue["example.com"]) > 0

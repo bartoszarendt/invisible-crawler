@@ -10,6 +10,7 @@ from crawler.redis_keys import dupefilter_key_pattern, requests_key_pattern
 from env_config import (
     get_crawler_user_agent,
     get_enable_claim_protocol,
+    get_enable_persistent_dupefilter,
     get_enable_smart_scheduling,
     get_log_level,
     get_redis_url,
@@ -135,11 +136,13 @@ SCHEDULER = (
 )
 
 # DupeFilter for URL deduplication
-# Note: Phase C uses local dupefilter; Phase A/B uses Redis dupefilter
+# Note: Phase C uses local dupefilter by default; Phase A/B uses Redis dupefilter
+# When ENABLE_PERSISTENT_DUPEFILTER=true, uses Redis-backed dupefilter for Phase C
+_use_persistent = get_enable_persistent_dupefilter()
 DUPEFILTER_CLASS = (
-    "scrapy.dupefilters.RFPDupeFilter"  # Local dupefilter (Phase C)
-    if _is_phase_c
-    else "scrapy_redis.dupefilter.RFPDupeFilter"  # Redis dupefilter (Phases A/B)
+    "crawler.dupefilter.PersistentRFPDupeFilter"  # Persistent Redis dupefilter
+    if _use_persistent
+    else "scrapy.dupefilters.RFPDupeFilter"  # Local in-memory dupefilter
 )
 
 # Queue class - supports priority and per-domain tracking

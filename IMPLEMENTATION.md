@@ -2,9 +2,9 @@
 
 ## Status
 
-**Date:** 2026-02-07  
+**Date:** 2026-02-13  
 **Phase:** 2 + Domain Tracking Phases A, B, C + Phase C Hardening  
-**Verification:** Local validation on 2026-02-07: `ruff check .` passed, `pytest -q` passed with `190 passed, 35 skipped` (DB-backed tests skipped when `DATABASE_URL` is unset).
+**Verification:** Local validation on 2026-02-13: `ruff check .` passed, `mypy crawler/ processor/ storage/` passed, `pytest -q` passed with `194 passed, 56 skipped` (`250` collected; DB-backed tests skipped when `DATABASE_URL` is unset).
 
 ---
 
@@ -18,7 +18,12 @@
 - ✅ Stale run cleanup: `cleanup-stale-runs` command for operational hygiene
 - ✅ Startup validation: claim protocol requires smart scheduling (enforced at init)
 
-**Design Document**: [PHASE_C_HARDENING.md](PHASE_C_HARDENING.md)
+**Validated issues addressed by hardening (now documented here):**
+- Claim protocol overlap caused by shared worker queue in Phase C
+- Domain stats double-counting during `closed()`
+- Force-kill progress loss from close-only persistence
+- Missing operator path to force-release active claims
+- Stale `crawl_runs` records with no automated cleanup
 
 ---
 
@@ -65,7 +70,7 @@ Phase 2 adds distributed crawling capabilities using Redis-based scheduling and 
    - Connection pooling via `ThreadedConnectionPool`
 
 4. **Tests** ([tests/](tests/))
-   - 225 collected tests (unit + integration)
+   - 250 collected tests (unit + integration)
    - Mock HTTP server via `pytest-httpserver`
    - DB-backed tests require running PostgreSQL and setting `DATABASE_URL`
    - Includes Phase B/C coverage for checkpoints, claim protocol, priority calculation, and concurrency
@@ -452,7 +457,7 @@ The `domains` table tracks:
 ### Acceptance Criteria Met
 
 ✅ Migration runs cleanly and is reversible  
-✅ Test suite is green in local non-DB mode (`190 passed, 35 skipped`)  
+✅ Test suite is green in local non-DB mode (`194 passed, 56 skipped`)  
 ✅ Domain tracking tests (unit + integration) are present and passing  
 ✅ Crawl runs successfully with tracking enabled  
 ✅ `domains` table populates during crawl  
@@ -776,7 +781,7 @@ Pipeline ensures provenance record
 ### Stopping Conditions
 
 - Crawl stops when `max_pages` is reached OR queue is exhausted
-- Default `max_pages=10` unless overridden via `-a max_pages=...`
+- If `-a max_pages=...` is omitted, default comes from `CRAWLER_MAX_PAGES` (code default: `100000`)
 - Redis queues persist across runs unless `SCHEDULER_FLUSH_ON_START=True`
 
 ---
@@ -785,10 +790,15 @@ Pipeline ensures provenance record
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `APP_ENV` | `dev` | Deployment environment label (`dev`, `staging`, `prod`) |
+| `CRAWL_PROFILE` | `conservative` | Crawl tuning profile (`conservative`, `broad`) |
 | `DATABASE_URL` | `postgresql://localhost/invisible` | PostgreSQL connection string |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection string (Phase 2) |
+| `QUEUE_NAMESPACE` | `` | Optional Redis key prefix for queue/version isolation |
 | `CRAWLER_USER_AGENT` | `InvisibleCrawler/0.1 (...)` | User-Agent for HTTP requests |
+| `CRAWLER_MAX_PAGES` | `100000` | Default spider page cap when `-a max_pages` is not provided |
 | `DISCOVERY_REFRESH_AFTER_DAYS` | `0` (disabled) | Re-fetch images older than N days |
+| `DOMAIN_STATS_FLUSH_INTERVAL_PAGES` | `100` | Mid-crawl domain stats flush interval (0 disables) |
 | `IMAGE_MIN_WIDTH` | `256` | Minimum image width in pixels |
 | `IMAGE_MIN_HEIGHT` | `256` | Minimum image height in pixels |
 | `LOG_LEVEL` | `INFO` | Log verbosity level |
@@ -800,26 +810,29 @@ Pipeline ensures provenance record
 | `OBJECT_STORE_SECURE` | `false` | Use TLS for MinIO/S3 (reserved for Phase 3) |
 | `ENABLE_DOMAIN_TRACKING` | `true` | Enable domain upsert and stats tracking (Phase A) |
 | `DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS` | `false` | Collapse subdomains to registrable domain (Phase A) |
-| `ENABLE_PER_DOMAIN_BUDGET` | `false` | Use per-domain page limits instead of global (Phase B) |
-| `MAX_PAGES_PER_RUN` | `1000` | Default per-domain page limit when per-domain budgets enabled (Phase B) |
+| `ENABLE_PER_DOMAIN_BUDGET` | `true` | Use per-domain page limits instead of global (Phase B) |
+| `MAX_PAGES_PER_RUN` | `100` | Default per-domain page limit when per-domain budgets enabled (Phase B) |
 | `ENABLE_SMART_SCHEDULING` | `false` | Query domains table for candidates instead of seeds (Phase C) |
 | `ENABLE_CLAIM_PROTOCOL` | `false` | Claim domains before crawling (Phase C) |
 
 ---
 
-## Validation Snapshot (2026-02-07)
+## Validation Snapshot (2026-02-13)
 
 ### Local Validation
 
 - `python -m ruff check .` → pass
-- `pytest -q` → `190 passed, 35 skipped`
+- `python -m mypy crawler/ processor/ storage/` → pass
+- `pytest -q` → `194 passed, 56 skipped` (`250` collected)
 
-### Why 35 Tests Are Skipped
+### Why 56 Tests Are Skipped
 
 Skipped tests are DB-backed domain-tracking suites that require `DATABASE_URL`:
+- `tests/test_cli.py`
 - `tests/test_domain_claim.py`
+- `tests/test_mid_crawl_flush.py`
 - `tests/test_priority_calculation.py`
-- `tests/test_concurrency.py`
+- DB-dependent portions of `tests/test_concurrency.py`
 
 To run all tests, provide a live PostgreSQL database and set `DATABASE_URL` before running `pytest`.
 

@@ -30,6 +30,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,6 +60,20 @@ services:
       SCRAPY_RETRY_ENABLED: ${SCRAPY_RETRY_ENABLED:-true}
       SCRAPY_RETRY_TIMES: ${SCRAPY_RETRY_TIMES:-}
       WAIT_FOR_DEPENDENCIES: ${WAIT_FOR_DEPENDENCIES:-true}
+      # Phase A: Domain tracking
+      ENABLE_DOMAIN_TRACKING: ${ENABLE_DOMAIN_TRACKING:-true}
+      DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS: ${DOMAIN_CANONICALIZATION_STRIP_SUBDOMAINS:-false}
+      # Phase B: Per-domain budget
+      ENABLE_PER_DOMAIN_BUDGET: ${ENABLE_PER_DOMAIN_BUDGET:-true}
+      MAX_PAGES_PER_RUN: ${MAX_PAGES_PER_RUN:-100}
+      # Phase C: Smart scheduling (requires both flags together)
+      ENABLE_SMART_SCHEDULING: ${ENABLE_SMART_SCHEDULING:-false}
+      ENABLE_CLAIM_PROTOCOL: ${ENABLE_CLAIM_PROTOCOL:-false}
+      ENABLE_CONTINUOUS_MODE: ${ENABLE_CONTINUOUS_MODE:-false}
+      ENABLE_PERSISTENT_DUPEFILTER: ${ENABLE_PERSISTENT_DUPEFILTER:-false}
+      DOMAIN_STATS_FLUSH_INTERVAL_PAGES: ${DOMAIN_STATS_FLUSH_INTERVAL_PAGES:-100}
+      # InvisibleID evolution
+      ENABLE_IMMUTABLE_ASSETS: ${ENABLE_IMMUTABLE_ASSETS:-false}
     command:
       [
         "sh",
@@ -66,11 +81,15 @@ services:
         "exec scrapy crawl ${CRAWLER_SPIDER:-discovery} -a max_pages=${CRAWLER_MAX_PAGES:-10}",
       ]
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'scrapy crawl' > /dev/null"]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import os, psycopg2, sys; dsn=os.environ.get('DATABASE_URL'); conn=psycopg2.connect(dsn); cur=conn.cursor(); cur.execute(\\\"SELECT COUNT(*) FROM crawl_log WHERE crawled_at > NOW() - INTERVAL '10 minutes'\\\"); recent=cur.fetchone()[0]; cur.execute(\\\"SELECT COUNT(*) FROM crawl_runs WHERE status='running' AND started_at > NOW() - INTERVAL '30 minutes'\\\"); running=cur.fetchone()[0]; cur.close(); conn.close(); sys.exit(0 if recent > 0 or running > 0 else 1)\"",
+        ]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s
     volumes:
       - crawler_state:/app/.scrapy
       - crawler_logs:/app/logs
