@@ -208,9 +208,16 @@ Leaves ~2.5 GB for OS and Docker daemon. CPU limits allow burst above reservatio
 
 1. Create `.env.prod` from `.env.prod.example` and set secrets.
 2. Build/pull production image.
-3. Run migrations before crawler restart.
-4. Start stack:
-   - `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d`
+3. Start dependencies:
+   - `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d postgres redis`
+4. Run migrations:
+   - `docker compose --env-file .env.prod -f docker-compose.yml run --rm --profile ops migrate`
+5. Ingest seeds (first bootstrap or namespace switch):
+   - `SEED_LIMIT=10000 docker compose --env-file .env.prod -f docker-compose.yml run --rm --profile ops seed_ingest`
+6. Start crawler workers:
+   - `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d crawler`
+7. Verify run status:
+   - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli list-runs --limit 20`
 
 ### 6.3 Common runtime commands
 
@@ -220,6 +227,16 @@ Leaves ~2.5 GB for OS and Docker daemon. CPU limits allow burst above reservatio
   - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli list-runs --limit 20`
 - Seed ingestion (custom limit):
   - `SEED_LIMIT=10000 docker compose --env-file .env.prod -f docker-compose.yml run --rm --profile ops seed_ingest`
+- Domain status:
+  - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli domain-status --limit 20`
+- Recalculate priorities:
+  - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli recalculate-priorities`
+- Release stuck claims:
+  - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli release-stuck-claims`
+- Cleanup stale runs:
+  - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli cleanup-stale-runs --older-than-minutes 60`
+- Cleanup persistent dupefilter fingerprints (only when `ENABLE_PERSISTENT_DUPEFILTER=true`):
+  - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli cleanup-fingerprints`
 
 ## 7. Update and Rollback Strategy
 
@@ -244,28 +261,39 @@ If scheduler/request serialization changes:
 3. Restart crawler service.
 4. Keep DB rollback limited to tested reversible migrations only.
 
-### 7.3 Phase C Hardening Rollout (Operational)
+### 7.3 Phase C+ Rollout (Operational)
 
-Use a staged canary with explicit flags and captured evidence.
+Use a staged canary with explicit flags and captured evidence. Keep this deployment rule:
+- Do not run Phase A/B workers at the same time as Phase C workers.
 
 1. Ensure Phase A/B workers are stopped.
-2. Run a 1-worker canary:
-   - `ENABLE_SMART_SCHEDULING=true ENABLE_CLAIM_PROTOCOL=true scrapy crawl discovery`
-3. Run validation queries:
+2. Set Phase C flags in `.env.prod`:
+   - `ENABLE_SMART_SCHEDULING=true`
+   - `ENABLE_CLAIM_PROTOCOL=true`
+   - `ENABLE_CONTINUOUS_MODE=true` (recommended for VPS workers)
+   - `ENABLE_PERSISTENT_DUPEFILTER=true` (recommended for resumability)
+3. Rebuild/restart a single canary worker:
+   - `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d --scale crawler=1 crawler`
+4. Run validation queries:
    - `psql $DATABASE_URL -f scripts/phase_c_validation.sql`
-4. Scale to 2-3 workers, repeat validation.
-5. Scale to 8 workers, repeat validation.
-6. Save evidence as `phase_c_hardening_validation_YYYYMMDD.md`.
+5. Scale to 2-3 workers, repeat validation:
+   - `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d --scale crawler=3 crawler`
+6. Scale to target worker count (for example 8), repeat validation.
+7. Save evidence as `phase_c_hardening_validation_YYYYMMDD.md`.
 
-### 7.4 Phase C Hardening Rollback (Operational)
+### 7.4 Phase C+ Rollback (Operational)
 
 If overlap or instability is detected:
 
 1. Disable Phase C flags:
-   - `export ENABLE_SMART_SCHEDULING=false ENABLE_CLAIM_PROTOCOL=false`
+   - Set `ENABLE_SMART_SCHEDULING=false`
+   - Set `ENABLE_CLAIM_PROTOCOL=false`
+   - Set `ENABLE_CONTINUOUS_MODE=false`
+   - Set `ENABLE_PERSISTENT_DUPEFILTER=false`
 2. Release active claims:
-   - `python -m crawler.cli release-stuck-claims --force --all-active`
-3. Restart crawlers in Phase A/B mode.
+   - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli release-stuck-claims --force --all-active`
+3. Restart crawler service:
+   - `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d crawler`
 
 ## 8. Security and Reliability Baseline
 
@@ -291,44 +319,22 @@ Practical SLO starter:
 - Redis queue not stalled for >30 min during active ingestion
 - migration job success before each production release
 
-## 10. Implementation Plan
+## 10. Current Maturity and Next Steps
 
-### Phase 1: Foundation (completed in this repo change)
+### 10.1 Implemented and VPS-ready
 
-1. Centralized env/config profile model:
-   - `env_config.py` now exposes typed getters for `APP_ENV`, `CRAWL_PROFILE`, Scrapy knobs, `QUEUE_NAMESPACE`, `CRAWLER_MAX_PAGES`.
-   - `APP_ENV` and `CRAWL_PROFILE` are allowlisted with safe fallback and warning logs on invalid values.
-2. Removed hardcoded spider crawl overrides to allow profile-driven settings.
-3. Added Redis key abstraction:
-   - `crawler/redis_keys.py`
-   - integrated into `crawler/settings.py`, `crawler/cli.py`, `crawler/spiders/discovery_spider.py`, `crawler/scheduler.py`.
-4. Added Docker scaffolding:
-   - `Dockerfile`
-   - `.dockerignore`
-   - `docker/entrypoint.sh`
-   - `docker-compose.yml`
-   - `docker-compose.dev.yml`
-   - `docker-compose.prod.yml`
-   - crawler container healthcheck in base compose
-   - production resource limits moved to `deploy.resources`
-5. Added environment templates:
-   - `.env.example` (expanded)
-   - `.env.dev.example`
-   - `.env.prod.example`
+1. Dockerized runtime with persistent state volumes.
+2. Domain tracking with per-domain budgets and smart scheduling/claim protocol flags.
+3. Continuous worker mode (`ENABLE_CONTINUOUS_MODE`) for long-lived VPS workers.
+4. Optional persistent URL dedup (`ENABLE_PERSISTENT_DUPEFILTER`) with cleanup command.
+5. InvisibleID evolution switch (`ENABLE_IMMUTABLE_ASSETS`) with additive schema support.
 
-### Phase 2: Operational hardening (recommended next)
+### 10.2 Recommended next hardening tasks
 
-1. Add CI pipeline for:
-   - lint, type-check, tests, container build
-2. Add health and metrics export endpoint for queue depth + crawl stats.
-3. Add scheduled backup automation for Postgres/Redis volumes.
-4. Add alerting thresholds for crawl stalls and error spikes.
-
-### Phase 3: Scaling path (when needed)
-
-1. Run multiple crawler workers against shared Redis frontier.
-2. Introduce dedicated ingestion worker schedule.
-3. Consider managed Postgres/Redis services for operational overhead reduction.
+1. Add CI pipeline for lint, type-check, tests, and image build.
+2. Add host-level backup automation for Postgres and Redis volumes.
+3. Add alerting thresholds for crawl stalls, claim leaks, and high 429/503 rates.
+4. Add operational dashboard for queue depth, run throughput, and domain status transitions.
 
 ## 11. File Map (Deployment-Relevant)
 

@@ -1,12 +1,12 @@
 # Domain-Centric Crawl Tracking — Design and Migration Reference
 
-**Date:** 2026-02-07  
-**Status:** Reference design (Phases A-C implemented; Phase D pending)  
+**Date:** 2026-02-13  
+**Status:** Reference design (Phases A-C implemented and hardened; Phase D pending)  
 **Author:** Automated design analysis  
 **Scope:** Schema additions, spider changes, scheduling logic, resume support, concurrency safety  
 **Review Findings:** Critical gaps identified in concurrency, frontier scale, canonicalization, and migration hardening
 
-> Implementation note (2026-02-13): Sections labeled as gaps/proposals are the pre-Phase-A baseline used to drive this design. Current runtime behavior and defaults are documented in `IMPLEMENTATION.md`.
+> Implementation note (2026-02-13): Sections labeled as gaps/proposals are the pre-Phase-A baseline used to drive this design. Current runtime behavior, flags (including continuous mode/persistent dupefilter/immutable assets), and migration chain are documented in `IMPLEMENTATION.md`.
 
 ---
 

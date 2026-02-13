@@ -3,27 +3,25 @@
 ## Status
 
 **Date:** 2026-02-13  
-**Phase:** 2 + Domain Tracking Phases A, B, C + Phase C Hardening  
+**Phase:** 2 + Domain Tracking Phases A, B, C (hardened) + Post-C operational fixes  
 **Verification:** Local validation on 2026-02-13: `ruff check .` passed, `mypy crawler/ processor/ storage/` passed, `pytest -q` passed with `194 passed, 56 skipped` (`250` collected; DB-backed tests skipped when `DATABASE_URL` is unset).
 
 ---
 
-## Recent Updates (2026-02-07)
+## Recent Updates (2026-02-13)
 
-**Phase C Hardening** - Reliability and resilience improvements:
-- ✅ Fixed double-count in `closed()` when claim protocol enabled
-- ✅ Queue/claim isolation: Phase C uses local scheduler to prevent cross-worker domain overlap
-- ✅ Mid-crawl state flushing: domain stats persisted every N pages (`DOMAIN_STATS_FLUSH_INTERVAL_PAGES=100`)
-- ✅ Force-release CLI: `release-stuck-claims --force` enables emergency recovery from dead workers  
-- ✅ Stale run cleanup: `cleanup-stale-runs` command for operational hygiene
-- ✅ Startup validation: claim protocol requires smart scheduling (enforced at init)
-
-**Validated issues addressed by hardening (now documented here):**
-- Claim protocol overlap caused by shared worker queue in Phase C
-- Domain stats double-counting during `closed()`
-- Force-kill progress loss from close-only persistence
-- Missing operator path to force-release active claims
-- Stale `crawl_runs` records with no automated cleanup
+**Post-Phase-C refresh and fixes:**
+- ✅ Frontier state tracking now uses per-domain deque queues in spider memory (`_domain_frontier_queue`) with domain status computed from true queue state
+- ✅ Domain frontier queue cap enforced at 1000 URLs/domain to avoid runaway in-memory growth
+- ✅ Continuous worker mode implemented (`ENABLE_CONTINUOUS_MODE`) with idle refill via `spider_idle` and `_refill_claims()`
+- ✅ `release_claim()` now always updates `last_crawled_at` on release
+- ✅ `cleanup-stale-runs` threshold is computed in Python and passed as a query parameter (no SQL timestamp interpolation)
+- ✅ Optional persistent URL dedup added (`ENABLE_PERSISTENT_DUPEFILTER`) via Redis-backed `PersistentRFPDupeFilter`
+- ✅ New cleanup command for dedup state: `python -m crawler.cli cleanup-fingerprints`
+- ✅ Alembic chain extended and verified:
+  - `2f1ae345c29f` -> `5e9f7b2c3d4a` (crawl_log `(crawl_run_id, page_url)` index)
+  - `5e9f7b2c3d4a` -> `6f0a8c3d4e5b` (image asset/observation/detection tables)
+- ✅ InvisibleID evolution flag added: `ENABLE_IMMUTABLE_ASSETS`
 
 ---
 
@@ -46,7 +44,7 @@ Phase 2 adds distributed crawling capabilities using Redis-based scheduling and 
 
 ---
 
-## What Exists (Phase 2)
+## What Exists (Current)
 
 ### Phase 1 Components (Retained)
 
@@ -125,6 +123,7 @@ Phase 2 adds distributed crawling capabilities using Redis-based scheduling and 
 invisible-crawler/
 ├── crawler/
 │   ├── cli.py
+│   ├── dupefilter.py
 │   ├── logging_config.py
 │   ├── pipelines.py
 │   ├── scheduler.py
@@ -151,7 +150,9 @@ invisible-crawler/
 │           ├── 44c69f17df6c_add_perceptual_hashes.py
 │           ├── 3b65381b0f4e_add_crawl_runs.py
 │           ├── 1c3fe655e18f_add_domains_table_phase_a.py  # Phase A
-│           └── 2f1ae345c29f_add_transition_domain_status_function.py  # Phase C
+│           ├── 2f1ae345c29f_add_transition_domain_status_function.py  # Phase C
+│           ├── 5e9f7b2c3d4a_add_crawl_log_run_page_index.py
+│           └── 6f0a8c3d4e5b_add_image_assets_observations.py
 ├── config/
 │   ├── seed_allowlist.txt
 │   ├── seed_blocklist.txt
@@ -172,7 +173,8 @@ invisible-crawler/
 │   ├── test_resume_from_checkpoint.py # Phase B
 │   ├── test_scheduler.py
 │   ├── test_smart_scheduling.py       # Phase C
-│   └── test_spider.py
+│   ├── test_spider.py
+│   └── test_mid_crawl_flush.py
 ├── alembic.ini
 ├── pyproject.toml
 ├── requirements.txt
@@ -213,6 +215,26 @@ invisible-crawler/
 - images_found, images_downloaded (INTEGER)
 - error_message (TEXT)
 - crawl_type (VARCHAR)
+
+**domains**
+- id (UUID, PK)
+- domain (VARCHAR, UNIQUE)
+- status (`domain_status`)
+- claimed_by, claim_expires_at, version (Phase C claim/lease state)
+- pages_crawled, images_found, images_stored (cumulative counters)
+- priority_score, last_crawled_at, next_crawl_after
+- frontier_checkpoint_id, frontier_size
+
+**crawl_runs**
+- id (UUID, PK)
+- mode, status
+- started_at, completed_at
+- pages_crawled, images_found, images_downloaded
+- error_message, seed_source
+
+**image_assets / image_observations / invisibleid_detections**
+- Additive schema for immutable asset records and mutable observations/detections
+- Enabled via `ENABLE_IMMUTABLE_ASSETS`
 
 ---
 
@@ -500,6 +522,11 @@ See [DOMAIN_TRACKING_DESIGN.md](DOMAIN_TRACKING_DESIGN.md) for rollout details.
 4. **Graceful degradation**
    - Checkpoint storage/load failures are logged and skipped (crawl continues)
 
+5. **Frontier memory safety and status correctness**
+   - In-memory pending frontier now tracked as per-domain deque queues
+   - Max 1000 queued URLs per domain (cap)
+   - Domain status computed from actual queue size (`active` vs `exhausted`)
+
 ---
 
 ## Domain Tracking - Phase C Implementation
@@ -507,6 +534,11 @@ See [DOMAIN_TRACKING_DESIGN.md](DOMAIN_TRACKING_DESIGN.md) for rollout details.
 **Date:** 2026-02-07  
 **Status:** ✅ Complete  
 **Design Document:** [DOMAIN_TRACKING_DESIGN.md](DOMAIN_TRACKING_DESIGN.md) §9 (Phase C)
+
+**Post-implementation fixes (2026-02-13):**
+- `spider_idle` signal is connected in `from_crawler()`; continuous refill keeps workers alive when enabled
+- Alembic chain is linear through `5e9f7b2c3d4a` and `6f0a8c3d4e5b`
+- `release_claim()` updates `last_crawled_at` on every release
 
 Phase C is the **highest-risk phase** of domain tracking. It fundamentally changes how domains are selected (database-driven vs seed-driven) and introduces multi-worker concurrency with a claim/lease protocol.
 
@@ -546,11 +578,15 @@ Phase C is the **highest-risk phase** of domain tracking. It fundamentally chang
    - `domain-info <domain>`: Detailed domain information
    - `recalculate-priorities`: Recalculate all priority scores
    - `release-stuck-claims`: Cleanup expired claims
+   - `cleanup-stale-runs`: Mark stale `crawl_runs` as failed
+   - `cleanup-fingerprints`: Clear persistent URL fingerprints from Redis
 
 6. **Feature Flags** (`env_config.py`)
    - `ENABLE_SMART_SCHEDULING`: Query domains table for candidates (default: false)
    - `ENABLE_CLAIM_PROTOCOL`: Claim domains before crawl (default: false)
    - **Both must be enabled together** for Phase C
+   - `ENABLE_CONTINUOUS_MODE`: Refill claimable work on idle instead of exiting
+   - `ENABLE_PERSISTENT_DUPEFILTER`: Persist URL dedup fingerprints to Redis
    - `DOMAIN_STATS_FLUSH_INTERVAL_PAGES`: Pages between mid-crawl flushes (default: 100)
 
 7. **Tests** (42+ tests for Phase C)
@@ -581,7 +617,7 @@ Phase C uses the claim protocol; Phase A/B workers do not. Running mixed version
 export ENABLE_SMART_SCHEDULING=false ENABLE_CLAIM_PROTOCOL=false
 
 # Release all active claims
-psql $DATABASE_URL -c "UPDATE domains SET claimed_by = NULL, claim_expires_at = NULL WHERE claimed_by IS NOT NULL;"
+python -m crawler.cli release-stuck-claims --force --all-active
 ```
 
 ### Feature Flags
@@ -590,6 +626,8 @@ psql $DATABASE_URL -c "UPDATE domains SET claimed_by = NULL, claim_expires_at = 
 |----------|---------|-------------|
 | `ENABLE_SMART_SCHEDULING` | `false` | Query domains table for candidates (Phase C) |
 | `ENABLE_CLAIM_PROTOCOL` | `false` | Claim domains before crawl (Phase C) |
+| `ENABLE_CONTINUOUS_MODE` | `false` | Keep worker alive and refill claims when spider becomes idle |
+| `ENABLE_PERSISTENT_DUPEFILTER` | `false` | Persist URL fingerprints in Redis across restarts |
 
 ### Usage
 
@@ -606,6 +644,10 @@ python -m crawler.cli domain-status --status active --limit 20
 # Run with smart scheduling (single worker canary)
 ENABLE_SMART_SCHEDULING=true ENABLE_CLAIM_PROTOCOL=true \
   scrapy crawl discovery -a max_pages=1000
+
+# Keep worker alive in smart-scheduling mode (recommended on VPS)
+ENABLE_SMART_SCHEDULING=true ENABLE_CLAIM_PROTOCOL=true ENABLE_CONTINUOUS_MODE=true \
+  scrapy crawl discovery -a max_pages=0
 
 # Run with smart scheduling (multi-worker)
 # Terminal 1
@@ -626,6 +668,9 @@ python -m crawler.cli release-stuck-claims --force --all-active
 
 # Mark stale crawl runs as failed (no activity timeout)
 python -m crawler.cli cleanup-stale-runs --older-than-minutes 60
+
+# Clear persistent URL fingerprints (if persistent dupefilter is enabled)
+python -m crawler.cli cleanup-fingerprints
 ```
 
 **Phase C Hardening (2026-02-07):**
@@ -633,6 +678,8 @@ python -m crawler.cli cleanup-stale-runs --older-than-minutes 60
 - Queue isolation: Phase C uses local scheduler (per-worker queues) to prevent cross-worker domain overlap
 - Force-release CLI: `release-stuck-claims --force` enables recovery from dead workers
 - Stale run cleanup: `cleanup-stale-runs` marks inactive runs as failed for operational hygiene
+- Continuous mode: `ENABLE_CONTINUOUS_MODE` enables idle claim refills for long-running workers
+- Optional persistent URL dedup: `ENABLE_PERSISTENT_DUPEFILTER` + `cleanup-fingerprints`
 
 ### Phase C Hardening Validation Runbook
 
@@ -781,6 +828,7 @@ Pipeline ensures provenance record
 ### Stopping Conditions
 
 - Crawl stops when `max_pages` is reached OR queue is exhausted
+- With `ENABLE_CONTINUOUS_MODE=true` (Phase C), spider stays alive on idle and polls for new claimable domains
 - If `-a max_pages=...` is omitted, default comes from `CRAWLER_MAX_PAGES` (code default: `100000`)
 - Redis queues persist across runs unless `SCHEDULER_FLUSH_ON_START=True`
 
@@ -814,6 +862,9 @@ Pipeline ensures provenance record
 | `MAX_PAGES_PER_RUN` | `100` | Default per-domain page limit when per-domain budgets enabled (Phase B) |
 | `ENABLE_SMART_SCHEDULING` | `false` | Query domains table for candidates instead of seeds (Phase C) |
 | `ENABLE_CLAIM_PROTOCOL` | `false` | Claim domains before crawling (Phase C) |
+| `ENABLE_CONTINUOUS_MODE` | `false` | Keep Phase C workers running when no domains are currently claimable |
+| `ENABLE_PERSISTENT_DUPEFILTER` | `false` | Persist URL fingerprints in Redis for restart-safe deduplication |
+| `ENABLE_IMMUTABLE_ASSETS` | `false` | Use `image_assets`/`image_observations`/`invisibleid_detections` model |
 
 ---
 
