@@ -27,12 +27,16 @@ It includes:
 - `redis` (scheduler frontier + dedupe state)
 - `migrate` (one-off Alembic migrations)
 - `seed_ingest` (one-off seed loading)
+- `autoheal` (optional health-based restart watcher)
 
 ### 3.2 Compose files
 
 - `docker-compose.yml`: base stack and shared defaults
 - `docker-compose.dev.yml`: local development overrides
 - `docker-compose.prod.yml`: VPS production overrides (restart policy, resource limits)
+
+Optional reliability profile:
+- `--profile autoheal` enables the `autoheal` sidecar that restarts labeled containers when Docker healthcheck status is `unhealthy`.
 
 Default topology follows Umami-style self-hosting:
 - application + PostgreSQL + Redis are bundled in Compose with persistent volumes.
@@ -223,6 +227,19 @@ Leaves ~2.5 GB for OS and Docker daemon. CPU limits allow burst above reservatio
 7. Verify run status:
    - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli list-runs --limit 20`
 
+### 6.2.1 Optional: healthcheck-based auto-restart
+
+`restart: unless-stopped` already restarts on crashes/OOM exits. To also restart containers that stay running but become `unhealthy`, enable the optional `autoheal` profile.
+
+Start or update stack with autoheal enabled:
+- `docker compose --profile autoheal --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d`
+
+Verify autoheal is running:
+- `docker compose --profile autoheal --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml ps autoheal`
+
+Disable it later:
+- `docker compose --profile autoheal --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml stop autoheal`
+
 ### 6.3 Common runtime commands
 
 - Queue status:
@@ -308,6 +325,7 @@ If overlap or instability is detected:
 5. Configure host-level firewall and restrict DB/Redis public exposure.
 6. Back up Postgres and Redis persistence volumes.
 7. Include valid crawler contact in `CRAWLER_USER_AGENT`.
+8. Optional: use `--profile autoheal` for healthcheck-based restarts of labeled services.
 
 ## 9. Monitoring and SLOs (Minimal Set)
 

@@ -44,3 +44,15 @@ services:
         "-c",
         "exec scrapy crawl ${CRAWLER_SPIDER:-discovery} -a max_pages=${CRAWLER_MAX_PAGES:-0}",
       ]
+
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: ${AUTOHEAL_INTERVAL:-30}
+      AUTOHEAL_START_PERIOD: ${AUTOHEAL_START_PERIOD:-120}
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: ${AUTOHEAL_DEFAULT_STOP_TIMEOUT:-10}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    profiles: ["autoheal"]
