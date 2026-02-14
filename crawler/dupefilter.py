@@ -34,6 +34,18 @@ class PersistentRFPDupeFilter(BaseDupeFilter):
         self.fingerprints_key = f"{key_prefix}:fingerprints"
 
     @classmethod
+    def from_crawler(cls, crawler: Any) -> "PersistentRFPDupeFilter":
+        """Create dupefilter from Scrapy crawler.
+
+        Args:
+            crawler: Scrapy crawler instance.
+
+        Returns:
+            Configured dupefilter instance.
+        """
+        return cls.from_settings(crawler.settings)
+
+    @classmethod
     def from_settings(cls, settings: Any) -> "PersistentRFPDupeFilter":
         """Create dupefilter from Scrapy settings.
 
