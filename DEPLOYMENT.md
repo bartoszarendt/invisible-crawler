@@ -34,6 +34,10 @@ It includes:
 - `docker-compose.dev.yml`: local development overrides
 - `docker-compose.prod.yml`: VPS production overrides (restart policy, resource limits)
 
+Default topology follows Umami-style self-hosting:
+- application + PostgreSQL + Redis are bundled in Compose with persistent volumes.
+- optional external mode remains supported by overriding `DATABASE_URL` and `REDIS_URL`.
+
 ### 3.3 Persistence
 
 - `postgres_data` volume
@@ -198,9 +202,9 @@ Leaves ~2.5 GB for OS and Docker daemon. CPU limits allow burst above reservatio
 3. Start dependencies:
    - `docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis`
 4. Run migrations:
-   - `docker compose --env-file .env.dev -f docker-compose.yml run --rm --profile ops migrate`
+   - `docker compose --profile ops --env-file .env.dev -f docker-compose.yml run --rm migrate`
 5. Optionally ingest seeds:
-   - `docker compose --env-file .env.dev -f docker-compose.yml run --rm --profile ops seed_ingest`
+   - `docker compose --profile ops --env-file .env.dev -f docker-compose.yml run --rm seed_ingest`
 6. Start crawler:
    - `docker compose --env-file .env.dev -f docker-compose.yml -f docker-compose.dev.yml up -d crawler`
 
@@ -211,9 +215,9 @@ Leaves ~2.5 GB for OS and Docker daemon. CPU limits allow burst above reservatio
 3. Start dependencies:
    - `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d postgres redis`
 4. Run migrations:
-   - `docker compose --env-file .env.prod -f docker-compose.yml run --rm --profile ops migrate`
+   - `docker compose --profile ops --env-file .env.prod -f docker-compose.yml run --rm migrate`
 5. Ingest seeds (first bootstrap or namespace switch):
-   - `SEED_LIMIT=10000 docker compose --env-file .env.prod -f docker-compose.yml run --rm --profile ops seed_ingest`
+   - `SEED_LIMIT=10000 docker compose --profile ops --env-file .env.prod -f docker-compose.yml run --rm seed_ingest`
 6. Start crawler workers:
    - `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d crawler`
 7. Verify run status:
@@ -226,7 +230,7 @@ Leaves ~2.5 GB for OS and Docker daemon. CPU limits allow burst above reservatio
 - List crawl runs:
   - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli list-runs --limit 20`
 - Seed ingestion (custom limit):
-  - `SEED_LIMIT=10000 docker compose --env-file .env.prod -f docker-compose.yml run --rm --profile ops seed_ingest`
+   - `SEED_LIMIT=10000 docker compose --profile ops --env-file .env.prod -f docker-compose.yml run --rm seed_ingest`
 - Domain status:
   - `docker compose --env-file .env.prod -f docker-compose.yml run --rm crawler python -m crawler.cli domain-status --limit 20`
 - Recalculate priorities:

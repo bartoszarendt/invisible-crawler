@@ -139,11 +139,18 @@ SCHEDULER = (
 # Note: Phase C uses local dupefilter by default; Phase A/B uses Redis dupefilter
 # When ENABLE_PERSISTENT_DUPEFILTER=true, uses Redis-backed dupefilter for Phase C
 _use_persistent = get_enable_persistent_dupefilter()
-DUPEFILTER_CLASS = (
-    "crawler.dupefilter.PersistentRFPDupeFilter"  # Persistent Redis dupefilter
-    if _use_persistent
-    else "scrapy.dupefilters.RFPDupeFilter"  # Local in-memory dupefilter
-)
+if _is_phase_c:
+    DUPEFILTER_CLASS = (
+        "crawler.dupefilter.PersistentRFPDupeFilter"  # Optional Redis-backed dupefilter
+        if _use_persistent
+        else "scrapy.dupefilters.RFPDupeFilter"  # Local in-memory dupefilter
+    )
+else:
+    DUPEFILTER_CLASS = (
+        "crawler.dupefilter.PersistentRFPDupeFilter"  # Optional Redis-backed dupefilter
+        if _use_persistent
+        else "scrapy_redis.dupefilter.RFPDupeFilter"  # Redis scheduler-compatible dupefilter
+    )
 
 # Queue class - supports priority and per-domain tracking
 # Note: Only used by Redis scheduler (Phases A/B); ignored by local scheduler (Phase C)

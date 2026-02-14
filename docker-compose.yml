@@ -1,6 +1,33 @@
 name: invisible-crawler
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-invisible}
+      POSTGRES_USER: ${POSTGRES_USER:-invisible}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invisible}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   crawler:
     build:
       context: .
@@ -11,8 +38,8 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       CRAWL_PROFILE: ${CRAWL_PROFILE:-conservative}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://invisible:invisible@host.docker.internal:5432/invisible}
-      REDIS_URL: ${REDIS_URL:-redis://host.docker.internal:6379/0}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://invisible:invisible@postgres:5432/invisible}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       QUEUE_NAMESPACE: ${QUEUE_NAMESPACE:-}
       CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-InvisibleCrawler/0.1 (Docker crawler; contact=you@example.com)}
       CRAWLER_MAX_PAGES: ${CRAWLER_MAX_PAGES:-10}
@@ -46,6 +73,11 @@ services:
       DOMAIN_STATS_FLUSH_INTERVAL_PAGES: ${DOMAIN_STATS_FLUSH_INTERVAL_PAGES:-100}
       # InvisibleID evolution
       ENABLE_IMMUTABLE_ASSETS: ${ENABLE_IMMUTABLE_ASSETS:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command:
       [
         "sh",
@@ -73,8 +105,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://invisible:invisible@host.docker.internal:5432/invisible}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://invisible:invisible@postgres:5432/invisible}
       WAIT_FOR_DEPENDENCIES: ${WAIT_FOR_DEPENDENCIES:-true}
+    depends_on:
+      postgres:
+        condition: service_healthy
     command: ["alembic", "upgrade", "head"]
     restart: "no"
     profiles: ["ops"]
@@ -86,9 +121,12 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      REDIS_URL: ${REDIS_URL:-redis://host.docker.internal:6379/0}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       QUEUE_NAMESPACE: ${QUEUE_NAMESPACE:-}
       WAIT_FOR_DEPENDENCIES: ${WAIT_FOR_DEPENDENCIES:-true}
+    depends_on:
+      redis:
+        condition: service_healthy
     command:
       [
         "python",
@@ -106,5 +144,7 @@ services:
     profiles: ["ops"]
 
 volumes:
+  postgres_data:
+  redis_data:
   crawler_state:
   crawler_logs:
