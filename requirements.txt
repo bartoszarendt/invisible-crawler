@@ -6,6 +6,7 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 alembic>=1.13.0
 redis>=5.0.0
+brotlicffi>=1.1.0
 
 # Image processing
 imagehash>=4.3.0
