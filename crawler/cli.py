@@ -697,14 +697,14 @@ def cleanup_stale_runs_command(args: argparse.Namespace) -> int:
                 return 0
 
             # Mark as failed
-            run_ids = [r[0] for r in stale_runs]
+            run_ids = [str(r[0]) for r in stale_runs]
             cur.execute(
                 """
                 UPDATE crawl_runs
                 SET status = 'failed',
                     completed_at = CURRENT_TIMESTAMP,
                     error_message = 'Marked stale: no activity timeout'
-                WHERE id = ANY(%s)
+                WHERE id = ANY(%s::uuid[])
                 """,
                 (run_ids,),
             )
